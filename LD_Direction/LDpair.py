@@ -1,217 +1,180 @@
 #!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Modified LDpair from:
 
-# Create LDpair function
+https://github.com/CBIIT/nci-webtools-dceg-linkage/blob/master/LDlink/LDpair.py
+"""
+import os
+import json
+import math
+import time
+import subprocess
+from . import dbsnp_db
+
+DB_SNP_VER = '149'
+
+POPULATIONS = ["ALL", "AFR", "AMR", "EAS", "EUR", "SAS", "ACB", "ASW", "BEB",
+               "CDX", "CEU", "CHB", "CHS", "CLM", "ESN", "FIN", "GBR", "GIH",
+               "GWD", "IBS", "ITU", "JPT", "KHV", "LWK", "MSL", "MXL", "PEL",
+               "PJL", "PUR", "STU", "TSI", "YRI"]
+
+# Set data directories
+DATA_DIR = "/local/content/ldlink/data/"
+SNP_DIR = DATA_DIR + "snp142/snp142_annot_2.db"
+POP_DIR = DATA_DIR + "1000G/Phase3/samples/"
+VCF_DIR = DATA_DIR + "1000G/Phase3/genotypes/ALL.chr"
+TMP_DIR = "./tmp/"
+
+class SNP_Lookup_Failure(Exception):
+
+    """Simple Exception."""
+
+    pass
 
 
-def calculate_pair(snp1, snp2, pop, request=None):
-    import json,math,os,sqlite3,subprocess,sys
+def output_json(output):
+    """Return JSON formated string."""
+    return json.dumps(output, sort_keys=True, indent=2)
 
-    # Set data directories
-    data_dir = "/local/content/ldlink/data/"
-    snp_dir = data_dir + "snp142/snp142_annot_2.db"
-    pop_dir = data_dir + "1000G/Phase3/samples/"
-    vcf_dir = data_dir + "1000G/Phase3/genotypes/ALL.chr"
-    tmp_dir = "./tmp/"
 
+def run_cmnd(cmnd):
+    """Run a command and return the output split into a list by newline."""
+    return subprocess.check_output(
+        cmnd, shell=True
+    ).decode().strip().split('\n')
+
+
+def get_snp_info(snp):
+    """Use dbSNP and 1000genomes tabix to get SNP information."""
+    # Find RS numbers in dbSNP
+    db = dbsnp_db.DB(version=DB_SNP_VER, location=DATA_DIR)
+    snp_coord = db.lookup_rsids(snp)
+
+    # Get SNP info from 1000genomes
+    vcf_file = (
+        VCF_DIR + snp_coord.chrom +
+        ".phase3_shapeit2_mvncall_integrated_v5.20130502.genotypes.vcf.gz"
+    )
+    tabix_cmd = "tabix {0} {1}:{2}-{2} | grep -v -e END".format(
+        vcf_file, snp_coord.chrom, snp_coord.start
+    )
+    vcf = run_cmnd(tabix_cmd)
+
+    # Import SNP VCF files
+    if len(vcf) == 0:
+        raise SNP_Lookup_Failure(snp + " is not in 1000G reference panel.")
+    elif len(vcf) == 1:
+        geno = vcf[0].strip().split()
+    else:
+        geno = []
+        for line in vcf:
+            l = line.strip().split()
+            if l[2] == snp:
+                geno = l
+                break
+        if geno == []:
+            raise SNP_Lookup_Failure(snp + " is not in 1000G reference panel.")
+
+    if "," in geno[3] or "," in geno[4]:
+        raise SNP_Lookup_Failure(snp + " is not a biallelic variant.")
+
+    if len(geno[3]) == 1 and len(geno[4]) == 1:
+        snp_a1 = geno[3]
+        snp_a2 = geno[4]
+    elif len(geno[3]) == 1 and len(geno[4]) > 1:
+        snp_a1 = "-"
+        snp_a2 = geno[4][1:]
+    elif len(geno[3]) > 1 and len(geno[4]) == 1:
+        snp_a1 = geno[3][1:]
+        snp_a2 = "-"
+    elif len(geno[3]) > 1 and len(geno[4]) > 1:
+        snp_a1 = geno[3][1:]
+        snp_a2 = geno[4][1:]
+
+    allele = {
+        "0|0": [snp_a1, snp_a1],
+        "0|1": [snp_a1, snp_a2],
+        "1|0": [snp_a2, snp_a1],
+        "1|1": [snp_a2, snp_a2],
+        "0":   [snp_a1, "."],
+        "1":   [snp_a2, "."],
+        "./.": [".", "."],
+        ".":   [".", "."]
+    }
+
+    # Get headers
+    tabix_header_cmd = "tabix -H {} | grep CHROM".format(vcf_file)
+    head = run_cmnd(tabix_header_cmd)[0].strip().split()
+
+    return snp_coord, geno, allele, head, snp_a1, snp_a2
+
+
+def calculate_pair(snp1, snp2, pops, outfile):
+    """Find LD information for any two SNPs.
+
+    Parameters
+    ----------
+    snp1/snp2 : str
+        rsIDs to compare
+    pops : list
+        list of populations (e.g. YRI, ESN).
+    outfile : str
+        a file to write output to
+
+    Returns
+    -------
+    SNP_Pair
+        A SNP_Pair class with information about SNP linkage.
+    """
     # Ensure tmp directory exists
-    if not os.path.exists(tmp_dir):
-        os.makedirs(tmp_dir)
+    if not os.path.exists(TMP_DIR):
+        os.makedirs(TMP_DIR)
 
     # Create JSON output
     output = {}
 
-    # Connect to snp142 database
-    conn = sqlite3.connect(snp_dir)
-    conn.text_factory = str
-    cur = conn.cursor()
+    # Get SNP info
+    try:
+        (snp1_coord, geno1,
+         allele1, head1, snp1_a1, snp1_a2) = get_snp_info(snp1)
+        (snp2_coord, geno2,
+         allele2, head2, snp2_a1, snp2_a2) = get_snp_info(snp2)
+    except SNP_Lookup_Failure as e:
+        output["error"] = str(e)
+        return output_json(output)
 
-    def get_coords(rs):
-        id = rs.strip("rs")
-        t = (id,)
-        cur.execute("SELECT * FROM tbl_" + id[-1] + " WHERE id=?", t)
-        return cur.fetchone()
-
-    # Find RS numbers in snp142 database
-    # SNP1
-    snp1_coord = get_coords(snp1)
-    if snp1_coord == None:
-        output["error"] = snp1 + " is not in dbSNP build 142."
-        return(json.dumps(output, sort_keys=True, indent=2))
-        raise
-
-    # SNP2
-    snp2_coord = get_coords(snp2)
-    if snp2_coord == None:
-        output["error"] = snp2 + " is not in dbSNP build 142."
-        return(json.dumps(output, sort_keys=True, indent=2))
-        raise
-
-    # Close snp142 connection
-    cur.close()
-    conn.close()
+    for snp_coord in [snp1_coord, snp2_coord]:
+        if snp_coord is None:
+            output["error"] = '{} is not in dbSNP build {}.'.format(
+                snp_coord.name, DB_SNP_VER
+            )
+            return output_json(output)
 
     # Check if SNPs are on the same chromosome
-    if snp1_coord[1] != snp2_coord[1]:
-        output["warning"] = snp1 + " and " + \
-            snp2 + " are on different chromosomes"
+    if snp1_coord.chrom != snp2_coord.chrom:
+        output["warning"] = ("{} and {} are on different chromosomes"
+                             .format(snp1, snp2))
 
-    # Select desired ancestral populations
-    pops = pop.split("+")
-    pop_dirs = []
-    for pop_i in pops:
-        if pop_i in ["ALL", "AFR", "AMR", "EAS", "EUR", "SAS", "ACB", "ASW", "BEB", "CDX", "CEU", "CHB", "CHS", "CLM", "ESN", "FIN", "GBR", "GIH", "GWD", "IBS", "ITU", "JPT", "KHV", "LWK", "MSL", "MXL", "PEL", "PJL", "PUR", "STU", "TSI", "YRI"]:
-            pop_dirs.append(pop_dir + pop_i + ".txt")
-        else:
-            output["error"] = pop_i + " is not an ancestral population. Choose one of the following ancestral populations: AFR, AMR, EAS, EUR, or SAS; or one of the following sub-populations: ACB, ASW, BEB, CDX, CEU, CHB, CHS, CLM, ESN, FIN, GBR, GIH, GWD, IBS, ITU, JPT, KHV, LWK, MSL, MXL, PEL, PJL, PUR, STU, TSI, or YRI."
-            return(json.dumps(output, sort_keys=True, indent=2))
-            raise
-
-    get_pops = "cat " + " ".join(pop_dirs)
-    proc = subprocess.Popen(get_pops, shell=True, stdout=subprocess.PIPE)
-    pop_list = proc.stdout.readlines()
-
-    ids = [i.strip() for i in pop_list]
-    pop_ids = list(set(ids))
-
-    # Extract 1000 Genomes phased genotypes
-    # SNP1
-    vcf_file1 = vcf_dir + \
-        snp1_coord[
-            1] + ".phase3_shapeit2_mvncall_integrated_v5.20130502.genotypes.vcf.gz"
-    tabix_snp1 = "tabix {0} {1}:{2}-{2} | grep -v -e END".format(
-        vcf_file1, snp1_coord[1], snp1_coord[2])
-    proc1 = subprocess.Popen(tabix_snp1, shell=True, stdout=subprocess.PIPE)
-    vcf1 = proc1.stdout.readlines()
-
-    # SNP2
-    vcf_file2 = vcf_dir + \
-        snp2_coord[
-            1] + ".phase3_shapeit2_mvncall_integrated_v5.20130502.genotypes.vcf.gz"
-    tabix_snp2 = "tabix {0} {1}:{2}-{2} | grep -v -e END".format(
-        vcf_file2, snp2_coord[1], snp2_coord[2])
-    proc2 = subprocess.Popen(tabix_snp2, shell=True, stdout=subprocess.PIPE)
-    vcf2 = proc2.stdout.readlines()
-
-    # Import SNP VCF files
-    # SNP1
-    if len(vcf1) == 0:
-        output["error"] = snp1 + " is not in 1000G reference panel."
-        return(json.dumps(output, sort_keys=True, indent=2))
-        raise
-    elif len(vcf1) > 1:
-        geno1 = []
-        for i in range(len(vcf1)):
-            if vcf1[i].strip().split()[2] == snp1:
-                geno1 = vcf1[i].strip().split()
-        if geno1 == []:
-            output["error"] = snp1 + " is not in 1000G reference panel."
-            return(json.dumps(output, sort_keys=True, indent=2))
-            raise
-    else:
-        geno1 = vcf1[0].strip().split()
-
-    if geno1[2] != snp1:
-        if "warning" in output:
-            output["warning"] = output["warning"] + \
-                ". Genomic position for query variant1 (" + snp1 + \
-                ") does not match RS number at 1000G position (" + geno1[
-                2] + ")"
-        else:
-            output[
-                "warning"] = "Genomic position for query variant1 (" + snp1 + ") does not match RS number at 1000G position (" + geno1[2] + ")"
-        snp1 = geno1[2]
-
-    if "," in geno1[3] or "," in geno1[4]:
-        output["error"] = snp1 + " is not a biallelic variant."
-        return(json.dumps(output, sort_keys=True, indent=2))
-        raise
-
-    if len(geno1[3]) == 1 and len(geno1[4]) == 1:
-        snp1_a1 = geno1[3]
-        snp1_a2 = geno1[4]
-    elif len(geno1[3]) == 1 and len(geno1[4]) > 1:
-        snp1_a1 = "-"
-        snp1_a2 = geno1[4][1:]
-    elif len(geno1[3]) > 1 and len(geno1[4]) == 1:
-        snp1_a1 = geno1[3][1:]
-        snp1_a2 = "-"
-    elif len(geno1[3]) > 1 and len(geno1[4]) > 1:
-        snp1_a1 = geno1[3][1:]
-        snp1_a2 = geno1[4][1:]
-
-    allele1 = {"0|0": [snp1_a1, snp1_a1], "0|1": [snp1_a1, snp1_a2], "1|0": [snp1_a2, snp1_a1], "1|1": [
-        snp1_a2, snp1_a2], "0": [snp1_a1, "."], "1": [snp1_a2, "."], "./.": [".", "."], ".": [".", "."]}
-
-    # SNP2
-    if len(vcf2) == 0:
-        output["error"] = snp2 + " is not in 1000G reference panel."
-        return(json.dumps(output, sort_keys=True, indent=2))
-        raise
-    elif len(vcf2) > 1:
-        geno2 = []
-        for i in range(len(vcf2)):
-            if vcf2[i].strip().split()[2] == snp2:
-                geno2 = vcf2[i].strip().split()
-        if geno2 == []:
-            output["error"] = snp2 + " is not in 1000G reference panel."
-            return(json.dumps(output, sort_keys=True, indent=2))
-            raise
-    else:
-        geno2 = vcf2[0].strip().split()
-
-    if geno2[2] != snp2:
-        if "warning" in output:
-            output["warning"] = output["warning"] + \
-                ". Genomic position for query variant2 (" + snp2 + \
-                ") does not match RS number at 1000G position (" + geno2[
-                2] + ")"
-        else:
-            output[
-                "warning"] = "Genomic position for query variant2 (" + snp2 + ") does not match RS number at 1000G position (" + geno2[2] + ")"
-        snp2 = geno2[2]
-
-    if "," in geno2[3] or "," in geno2[4]:
-        output["error"] = snp2 + " is not a biallelic variant."
-        return(json.dumps(output, sort_keys=True, indent=2))
-        raise
-
-    if len(geno2[3]) == 1 and len(geno2[4]) == 1:
-        snp2_a1 = geno2[3]
-        snp2_a2 = geno2[4]
-    elif len(geno2[3]) == 1 and len(geno2[4]) > 1:
-        snp2_a1 = "-"
-        snp2_a2 = geno2[4][1:]
-    elif len(geno2[3]) > 1 and len(geno2[4]) == 1:
-        snp2_a1 = geno2[3][1:]
-        snp2_a2 = "-"
-    elif len(geno2[3]) > 1 and len(geno2[4]) > 1:
-        snp2_a1 = geno2[3][1:]
-        snp2_a2 = geno2[4][1:]
-
-    allele2 = {"0|0": [snp2_a1, snp2_a1], "0|1": [snp2_a1, snp2_a2], "1|0": [snp2_a2, snp2_a1], "1|1": [
-        snp2_a2, snp2_a2], "0": [snp2_a1, "."], "1": [snp2_a2, "."], "./.": [".", "."], ".": [".", "."]}
+    for geno, snp in [(geno1, snp1), (geno2, snp2)]:
+        if geno[2] != snp:
+            if "warning" not in output:
+                output["warning"] = ''
+            else:
+                output["warning"] += '. '
+            output["warning"] += (
+                "Genomic position for query variant1 ({}) does not match RS "
+                "number at 1000G position ({})"
+            ).format(snp, geno[2])
 
     if geno1[1] != snp1_coord[2]:
         output["error"] = "VCF File does not match variant coordinates for SNP1."
-        return(json.dumps(output, sort_keys=True, indent=2))
-        raise
+        return output_json(output)
     if geno2[1] != snp2_coord[2]:
         output["error"] = "VCF File does not match variant coordinates for SNP2."
-        return(json.dumps(output, sort_keys=True, indent=2))
-        raise
+        return output_json(output)
 
-    # Get headers
-    tabix_snp1_h = "tabix -H {0} | grep CHROM".format(vcf_file1)
-    proc1_h = subprocess.Popen(
-        tabix_snp1_h, shell=True, stdout=subprocess.PIPE)
-    head1 = proc1_h.stdout.readlines()[0].strip().split()
-
-    tabix_snp2_h = "tabix -H {0} | grep CHROM".format(vcf_file2)
-    proc2_h = subprocess.Popen(
-        tabix_snp2_h, shell=True, stdout=subprocess.PIPE)
-    head2 = proc2_h.stdout.readlines()[0].strip().split()
-
-    # Combine phased genotypes
+    ### Combine phased genotypes ###
     geno = {}
     for i in range(9, len(head1)):
         geno[head1[i]] = [allele1[geno1[i]], ".."]
@@ -219,6 +182,24 @@ def calculate_pair(snp1, snp2, pop, request=None):
     for i in range(9, len(head2)):
         if head2[i] in geno:
             geno[head2[i]][1] = allele2[geno2[i]]
+
+    # Select desired ancestral populations
+    pop_dirs = []
+    bad_pops = []
+    for pop_i in pops:
+        if pop_i in POPULATIONS:
+            pop_dirs.append(POP_DIR + pop_i + ".txt")
+        else:
+            bad_pops.append(pop_i)
+    if bad_pops:
+        output["error"] = (
+            "{} are not ancestral populations. Choose one of the following "
+            "ancestral populations: {}"
+        ).format(bad_pops, POPULATIONS)
+        return output_json(output)
+
+    get_pops_cmd = "cat {}".format(" ".join(pop_dirs))
+    pop_ids = list(set(run_cmnd(get_pops_cmd)))
 
     # Extract haplotypes
     hap = {}
@@ -269,7 +250,6 @@ def calculate_pair(snp1, snp2, pop, request=None):
     delta = float(A * D - B * C)
     Ms = float((A + C) * (B + D) * (A + B) * (C + D))
     if Ms != 0:
-
         # D prime
         if delta < 0:
             D_prime = abs(delta / min((A + C) * (A + B), (B + D) * (C + D)))
@@ -292,7 +272,7 @@ def calculate_pair(snp1, snp2, pop, request=None):
         p = "NA"
 
     # Find Correlated Alleles
-    if r2 > 0.1 and r2 != "NA":
+    if r2 != "NA" and r2 > 0.1:
 
         # Expected Cell Counts
         eA = (A + B) * (A + C) / N
@@ -307,30 +287,47 @@ def calculate_pair(snp1, snp2, pop, request=None):
         dD = (D - eD)**2
         dmax = max(dA, dB, dC, dD)
 
+        outstr = "{} ({}) allele is correlated with {} ({})"
         if dA == dB == dC == dD:
             if tmax == A or tmax == D:
-                corr1 = snp1 + "(" + sorted(hap)[0].split("_")[
-                    0] + ") allele is correlated with " + snp2 + "(" + sorted(hap)[0].split("_")[1] + ") allele"
-                corr2 = snp1 + "(" + sorted(hap)[2].split("_")[
-                    0] + ") allele is correlated with " + snp2 + "(" + sorted(hap)[1].split("_")[1] + ") allele"
+                corr1 = outstr.format(
+                    snp1, sorted(hap)[0].split("_")[0],
+                    snp2, sorted(hap)[0].split("_")[1]
+                )
+                corr2 = outstr.format(
+                    snp1, sorted(hap)[2].split("_")[0],
+                    snp2, sorted(hap)[1].split("_")[1]
+                )
                 corr_alleles = [corr1, corr2]
             else:
-                corr1 = snp1 + "(" + sorted(hap)[0].split("_")[
-                    0] + ") allele is correlated with " + snp2 + "(" + sorted(hap)[1].split("_")[1] + ") allele"
-                corr2 = snp1 + "(" + sorted(hap)[2].split("_")[
-                    0] + ") allele is correlated with " + snp2 + "(" + sorted(hap)[0].split("_")[1] + ") allele"
+                corr1 = outstr.format(
+                    snp1, sorted(hap)[0].split("_")[0],
+                    snp2, sorted(hap)[1].split("_")[1]
+                )
+                corr2 = outstr.format(
+                    snp1, sorted(hap)[2].split("_")[0],
+                    snp2, sorted(hap)[0].split("_")[1]
+                )
                 corr_alleles = [corr1, corr2]
         elif dmax == dA or dmax == dD:
-            corr1 = snp1 + "(" + sorted(hap)[0].split("_")[0] + ") allele is correlated with " + \
-                snp2 + "(" + sorted(hap)[0].split("_")[1] + ") allele"
-            corr2 = snp1 + "(" + sorted(hap)[2].split("_")[0] + ") allele is correlated with " + \
-                snp2 + "(" + sorted(hap)[1].split("_")[1] + ") allele"
+            corr1 = outstr.format(
+                snp1, sorted(hap)[0].split("_")[0],
+                snp2, sorted(hap)[0].split("_")[1]
+            )
+            corr2 = outstr.format(
+                snp1, sorted(hap)[2].split("_")[0],
+                snp2, sorted(hap)[1].split("_")[1]
+            )
             corr_alleles = [corr1, corr2]
         else:
-            corr1 = snp1 + "(" + sorted(hap)[0].split("_")[0] + ") allele is correlated with " + \
-                snp2 + "(" + sorted(hap)[1].split("_")[1] + ") allele"
-            corr2 = snp1 + "(" + sorted(hap)[2].split("_")[0] + ") allele is correlated with " + \
-                snp2 + "(" + sorted(hap)[0].split("_")[1] + ") allele"
+            corr1 = outstr.format(
+                snp1, sorted(hap)[0].split("_")[0],
+                snp2, sorted(hap)[1].split("_")[1]
+            )
+            corr2 = outstr.format(
+                snp1, sorted(hap)[2].split("_")[0],
+                snp2, sorted(hap)[0].split("_")[1]
+            )
             corr_alleles = [corr1, corr2]
     else:
         corr_alleles = [snp1 + " and " + snp2 + " are in linkage equilibrium"]
@@ -425,48 +422,45 @@ def calculate_pair(snp1, snp2, pop, request=None):
 
     output["corr_alleles"] = corr_alleles
 
-
     # Generate output file
-    ldpair_out=open(tmp_dir + "LDpair_" + request + ".txt", "w")
-    print("Query SNPs:", file=ldpair_out)
-    print(output["snp1"]["rsnum"] + " (" + output["snp1"]["coord"] + ")", file=ldpair_out)
-    print(output["snp2"]["rsnum"] + " (" + output["snp2"]["coord"] + ")", file=ldpair_out)
-    print("", file=ldpair_out)
-    print(pop + " Haplotypes:", file=ldpair_out)
-    print(" " * 15 + output["snp2"]["rsnum"], file=ldpair_out)
-    print(" " * 15 + output["snp2"]["allele_1"]["allele"] + " " * 7 + output["snp2"]["allele_2"]["allele"], file=ldpair_out)
-    print(" " * 13 + "-" * 17, file=ldpair_out)
-    print(" " * 11 + output["snp1"]["allele_1"]["allele"] + " | " + output["two_by_two"]["cells"]["c11"] + " " * (5 - len(output["two_by_two"]["cells"]["c11"])) + " | " + output["two_by_two"]["cells"]["c12"] + " " * (5 - len(output["two_by_two"]["cells"]["c12"])) + " | " + output["snp1"]["allele_1"]["count"] + " " * (5 - len(output["snp1"]["allele_1"]["count"])) + " (" + output["snp1"]["allele_1"]["frequency"] + ")", file=ldpair_out)
-    print(output["snp1"]["rsnum"] + " " * (10 - len(output["snp1"]["rsnum"])) + " " * 3 + "-" * 17, file=ldpair_out)
-    print(" " * 11 + output["snp1"]["allele_2"]["allele"] + " | " + output["two_by_two"]["cells"]["c21"] + " " * (5 - len(output["two_by_two"]["cells"]["c21"])) + " | " + output["two_by_two"]["cells"]["c22"] + " " * (5 - len(output["two_by_two"]["cells"]["c22"])) + " | " + output["snp1"]["allele_2"]["count"] + " " * (5 - len(output["snp1"]["allele_2"]["count"])) + " (" + output["snp1"]["allele_2"]["frequency"] + ")", file=ldpair_out)
-    print(" " * 13 + "-" * 17, file=ldpair_out)
-    print(" " * 15 + output["snp2"]["allele_1"]["count"] + " " * (5 - len(output["snp2"]["allele_1"]["count"])) + " " * 3 + output["snp2"]["allele_2"]["count"] + " " * (5 - len(output["snp2"]["allele_2"]["count"])) + " " * 3 + output["two_by_two"]["total"], file=ldpair_out)
-    print(" " * 14 + "(" + output["snp2"]["allele_1"]["frequency"] + ")" + " " * (5 - len(output["snp2"]["allele_1"]["frequency"])) + " (" + output["snp2"]["allele_2"]["frequency"] + ")" + " " * (5 - len(output["snp2"]["allele_2"]["frequency"])), file=ldpair_out)
-    print("", file=ldpair_out)
-    print("          " + output["haplotypes"]["hap1"]["alleles"] + ": " + output["haplotypes"]["hap1"]["count"] + " (" + output["haplotypes"]["hap1"]["frequency"] + ")", file=ldpair_out)
-    print("          " + output["haplotypes"]["hap2"]["alleles"] + ": " + output["haplotypes"]["hap2"]["count"] + " (" + output["haplotypes"]["hap2"]["frequency"] + ")", file=ldpair_out)
-    print("          " + output["haplotypes"]["hap3"]["alleles"] + ": " + output["haplotypes"]["hap3"]["count"] + " (" + output["haplotypes"]["hap3"]["frequency"] + ")", file=ldpair_out)
-    print("          " + output["haplotypes"]["hap4"]["alleles"] + ": " + output["haplotypes"]["hap4"]["count"] + " (" + output["haplotypes"]["hap4"]["frequency"] + ")", file=ldpair_out)
-    print("", file=ldpair_out)
-    print("          D': " + output["statistics"]["d_prime"], file=ldpair_out)
-    print("          R2: " + output["statistics"]["r2"], file=ldpair_out)
-    print("      Chi-sq: " + output["statistics"]["chisq"], file=ldpair_out)
-    print("     p-value: " + output["statistics"]["p"], file=ldpair_out)
-    print("", file=ldpair_out)
-    if len(output["corr_alleles"]) == 2:
-        print(output["corr_alleles"][0], file=ldpair_out)
-        print(output["corr_alleles"][1], file=ldpair_out)
-    else:
-        print(output["corr_alleles"][0], file=ldpair_out)
+    with open(outfile, 'w') as ldpair_out:
+        print("Query SNPs:", file=ldpair_out)
+        print(output["snp1"]["rsnum"] + " (" + output["snp1"]["coord"] + ")", file=ldpair_out)
+        print(output["snp2"]["rsnum"] + " (" + output["snp2"]["coord"] + ")", file=ldpair_out)
+        print("", file=ldpair_out)
+        print(pops + " Haplotypes:", file=ldpair_out)
+        print(" " * 15 + output["snp2"]["rsnum"], file=ldpair_out)
+        print(" " * 15 + output["snp2"]["allele_1"]["allele"] + " " * 7 + output["snp2"]["allele_2"]["allele"], file=ldpair_out)
+        print(" " * 13 + "-" * 17, file=ldpair_out)
+        print(" " * 11 + output["snp1"]["allele_1"]["allele"] + " | " + output["two_by_two"]["cells"]["c11"] + " " * (5 - len(output["two_by_two"]["cells"]["c11"])) + " | " + output["two_by_two"]["cells"]["c12"] + " " * (5 - len(output["two_by_two"]["cells"]["c12"])) + " | " + output["snp1"]["allele_1"]["count"] + " " * (5 - len(output["snp1"]["allele_1"]["count"])) + " (" + output["snp1"]["allele_1"]["frequency"] + ")", file=ldpair_out)
+        print(output["snp1"]["rsnum"] + " " * (10 - len(output["snp1"]["rsnum"])) + " " * 3 + "-" * 17, file=ldpair_out)
+        print(" " * 11 + output["snp1"]["allele_2"]["allele"] + " | " + output["two_by_two"]["cells"]["c21"] + " " * (5 - len(output["two_by_two"]["cells"]["c21"])) + " | " + output["two_by_two"]["cells"]["c22"] + " " * (5 - len(output["two_by_two"]["cells"]["c22"])) + " | " + output["snp1"]["allele_2"]["count"] + " " * (5 - len(output["snp1"]["allele_2"]["count"])) + " (" + output["snp1"]["allele_2"]["frequency"] + ")", file=ldpair_out)
+        print(" " * 13 + "-" * 17, file=ldpair_out)
+        print(" " * 15 + output["snp2"]["allele_1"]["count"] + " " * (5 - len(output["snp2"]["allele_1"]["count"])) + " " * 3 + output["snp2"]["allele_2"]["count"] + " " * (5 - len(output["snp2"]["allele_2"]["count"])) + " " * 3 + output["two_by_two"]["total"], file=ldpair_out)
+        print(" " * 14 + "(" + output["snp2"]["allele_1"]["frequency"] + ")" + " " * (5 - len(output["snp2"]["allele_1"]["frequency"])) + " (" + output["snp2"]["allele_2"]["frequency"] + ")" + " " * (5 - len(output["snp2"]["allele_2"]["frequency"])), file=ldpair_out)
+        print("", file=ldpair_out)
+        print("          " + output["haplotypes"]["hap1"]["alleles"] + ": " + output["haplotypes"]["hap1"]["count"] + " (" + output["haplotypes"]["hap1"]["frequency"] + ")", file=ldpair_out)
+        print("          " + output["haplotypes"]["hap2"]["alleles"] + ": " + output["haplotypes"]["hap2"]["count"] + " (" + output["haplotypes"]["hap2"]["frequency"] + ")", file=ldpair_out)
+        print("          " + output["haplotypes"]["hap3"]["alleles"] + ": " + output["haplotypes"]["hap3"]["count"] + " (" + output["haplotypes"]["hap3"]["frequency"] + ")", file=ldpair_out)
+        print("          " + output["haplotypes"]["hap4"]["alleles"] + ": " + output["haplotypes"]["hap4"]["count"] + " (" + output["haplotypes"]["hap4"]["frequency"] + ")", file=ldpair_out)
+        print("", file=ldpair_out)
+        print("          D': " + output["statistics"]["d_prime"], file=ldpair_out)
+        print("          R2: " + output["statistics"]["r2"], file=ldpair_out)
+        print("      Chi-sq: " + output["statistics"]["chisq"], file=ldpair_out)
+        print("     p-value: " + output["statistics"]["p"], file=ldpair_out)
+        print("", file=ldpair_out)
+        if len(output["corr_alleles"]) == 2:
+            print(output["corr_alleles"][0], file=ldpair_out)
+            print(output["corr_alleles"][1], file=ldpair_out)
+        else:
+            print(output["corr_alleles"][0], file=ldpair_out)
 
-    try:
-        output["warning"]
-    except KeyError:
-        www="do nothing"
-    else:
-        print("WARNING: " + output["warning"] + "!", file=ldpair_out)
-    ldpair_out.close()
-
+        try:
+            output["warning"]
+        except KeyError:
+            www="do nothing"
+        else:
+            print("WARNING: " + output["warning"] + "!", file=ldpair_out)
 
     # Return output
     return(json.dumps(output, sort_keys=True, indent=2))
