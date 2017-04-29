@@ -50,6 +50,8 @@ from urllib.request import urlopen as _get
 import pandas as _pd
 from numpy import nan as _nan
 
+from . import LDpair as _ld
+
 SLEEP_TIME = 1.0
 
 ###############################################################################
@@ -71,7 +73,7 @@ class SNP_Pair(object):
     loc1 : int
         Position of snp1 on chromosome
     loc2 : int
-        Position of snp1 on chromosome
+        Position of snp2 on chromosome
     dprime : float_or_nan
     rsquared : float_or_nan
     chisq : float_or_nan
@@ -96,79 +98,84 @@ class SNP_Pair(object):
     """
 
     def __init__(self, x):
-        """Parse an input string from LDpair."""
-        self.input_string = x
-        f = x.split('\n')
-        assert f[0] == 'Query SNPs:'
-        assert f[3] == ''
+        """Parse an input dictionary from LDpair."""
+        self.input_dict = x
 
-        self.snp1, self.chrom, self.loc1 = get_snps(f[1])
-        self.snp2, _, self.loc2 = get_snps(f[2])
-        self.populations = f[4].split(' ')[0].split('+')
+        self.snp1 = x['snp1']['name']
+        self.snp2 = x['snp2']['name']
 
-        snps = _re.split(r' +', f[6].strip())
-        s1, i1, i2, _, _ = _re.split(r' +[|(] *', f[8].strip(' )'))
-        s2, i3, i4, _, _ = _re.split(r' +[|(] *', f[10].strip(' )'))
+        self.chrom, self.loc1 = x['snp1']['coord'].split(':')
+        c2, self.loc2 = x['snp2']['coord'].split(':')
+        if c2 != self.chrom:
+            _sys.stderr.write('{}: WARNING: SNPs on different chromosomes.'
+                              .format([self.snp1, self.snp2]))
+            self.chrom = 'multiple'
+        self.loc1 = int(self.loc1)
+        self.loc2 = int(self.loc2)
 
-        cols = _pd.MultiIndex.from_tuples([(self.snp2, i) for i in snps])
-        indx = _pd.MultiIndex.from_tuples([(self.snp1, i) for i in [s1, s2]])
+        self.snp1_rs = x['snp1']['rsnum']
+        self.snp2_rs = x['snp2']['rsnum']
+
+        self.haplotypes = x['haplotypes']
+
+        self.populations = x['populations']
+
+        if x['corr_alleles'][0].endswith('are in linkage equilibrium'):
+            self.lookup = {}
+            self.inld = False
+        else:
+            self.lookup = x['corr_dictionary']
+            self.inld = True
+
+        self.alleles = {
+            self.snp1: [
+                x['snp1']['allele_1']['allele'],
+                x['snp1']['allele_2']['allele']
+            ],
+            self.snp2 : [
+                x['snp2']['allele_1']['allele'],
+                x['snp2']['allele_2']['allele']
+            ]
+        }
+
+        # Make a pandas table of haplotypes
+        cols = _pd.MultiIndex.from_tuples(
+            [(self.snp2, i) for i in self.alleles[self.snp1]]
+        )
+        indx = _pd.MultiIndex.from_tuples(
+            [(self.snp1, i) for i in self.alleles[self.snp2]]
+        )
+        t = x['two_by_two']['cells']
         self.table = _pd.DataFrame(
-            [[int(i1), int(i2)],
-             [int(i3), int(i4)]],
+            [[int(t['c11']), int(t['c12'])],
+             [int(t['c21']), int(t['c22'])]],
             columns=cols, index=indx
         )
-        self.snp1_alleles = [s1, s2]
-        self.snp2_alleles = snps
-        self.alleles = {self.snp1: self.snp1_alleles, self.snp2: self.snp2_alleles}
 
-        self.dprime = f[20].strip().split(':')[1].strip()
+        self.dprime = x['statistics']['d_prime']
         try:
             self.dprime = float(self.dprime)
         except ValueError:
             self.dprime = _nan
-        self.rsquared = f[21].strip().split(':')[1].strip()
+
+        self.rsquared = x['statistics']['r2']
         try:
             self.rsquared = float(self.dprime)
         except ValueError:
             self.rsquared = _nan
-        self.chisq = f[22].strip().split(':')[1].strip()
+
+        self.chisq = x['statistics']['chisq']
         try:
             self.chisq = float(self.dprime)
         except ValueError:
             self.chisq = _nan
-        p = f[23].strip().split(':')[1].strip()
+
+        p = x['statistics']['p']
         try:
             self.p = 0.0 if p == '<0.0001' else float(p)
         except ValueError:
             self.p = _nan
         self.p_str = p
-
-        if f[25].strip().endswith('are in linkage equilibrium'):
-            self.lookup = {}
-            self.inld = False
-        else:
-            self.inld = True
-            s1a, a1a, s2a, a2a = correlation_lookup.findall(f[25])[0]
-            s1b, a1b, s2b, a2b = correlation_lookup.findall(f[26])[0]
-            a1a = a1a.upper()
-            a1b = a1b.upper()
-            a2a = a2a.upper()
-            a2b = a2b.upper()
-            assert s1a == self.snp1
-            assert s1b == self.snp1
-            assert s2a == self.snp2
-            assert s2b == self.snp2
-
-            self.lookup = {
-                self.snp1: {
-                    a1a: a2a,
-                    a1b: a2b,
-                },
-                self.snp2: {
-                    a2a: a1a,
-                    a2b: a1b,
-                },
-            }
 
     def lookup_other(self, snp, allele):
         """Return the linked allele for a given snp.
@@ -215,28 +222,15 @@ class SNP_Pair(object):
 
     def __repr__(self):
         """Return infomation"""
-        return "SNP_Pair<{snp1}({snp1_a}:{snp2}({snp2_a}) R2: {r2} (P: {P})>".format(
-            snp1=self.snp1, snp1_a=self.snp1_alleles,
-            snp2=self.snp2, snp2_a=self.snp2_alleles,
+        return "SNP_Pair<{snp1}({snp1_a}):{snp2}({snp2_a}) R2: {r2} (P: {P})>".format(
+            snp1=self.snp1, snp1_a=self.alleles[self.snp1],
+            snp2=self.snp2, snp2_a=self.alleles[self.snp2],
             r2=self.rsquared, P=self.p_str
         )
 
     def __str__(self):
         """Print summary"""
-        return (
-            'Chromosome: {}\n'.format(self.chrom) +
-            "SNP1: {} ({}), Alleles: {}\n".format(
-                self.snp1, self.loc1, self.snp1_alleles) +
-            "SNP2: {} ({}), Alleles: {}\n".format(
-                self.snp2, self.loc2, self.snp2_alleles) +
-            "Population(s): {}\n".format(self.populations) +
-            "Associations (rows are SNP1, columns are SNP2):\n" +
-            "\n{}\n\n".format(self.table) +
-            "R\u00b2: {}\n".format(self.rsquared) +
-            "D': {}\n".format(self.dprime) +
-            "Chi-Squared: {}\n".format(self.chisq) +
-            "P-value: {}\n".format(self.p_str)
-        )
+        return _ld.print_summary(self.input_dict)
 
 
 ###############################################################################
@@ -290,8 +284,6 @@ def compare_two_variants(var1: str, var2: str, populations: list) -> SNP_Pair:
     Uses the LDpair API:
         https://analysistools.nci.nih.gov/LDlink/?tab=ldpair
 
-    Tries 10 times on error.
-
     Parameters
     ----------
     var1/var2 : str
@@ -310,26 +302,7 @@ def compare_two_variants(var1: str, var2: str, populations: list) -> SNP_Pair:
     if isinstance(populations, str):
         populations = [populations]
 
-    i = 10
-    while True:
-        try:
-            req = _get(
-                'https://analysistools.nci.nih.gov/LDlink/LDlinkRest/' +
-                'ldpair?var1={}&var2={}&pop={}'.format(
-                    var1, var2, '%2B'.join(populations)
-                )
-            )
-            out = SNP_Pair(req.read().decode())
-        except:
-            if not i:
-                print('Failed on {} {} {}'.format(var1, var2, populations))
-                raise
-            i -= 1
-            _sleep(SLEEP_TIME)
-            continue
-        break
-
-    return out
+    return SNP_Pair(_ld.calculate_pair(var1, var2, populations))
 
 
 ###############################################################################

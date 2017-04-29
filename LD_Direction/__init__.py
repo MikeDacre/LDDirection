@@ -32,3 +32,8 @@ population-specific haplotype structure and linking correlated alleles of
 possible functional variants. Bioinformatics. 2015 Jul 2. PMID: 26139635.
 """
 __version__ = '0.1a'
+
+# Make core functions easily available
+from . import snp_link
+from .snp_link import compare_variants
+from .snp_link import compare_two_variants
