@@ -1,4 +1,7 @@
-# LDDirection
+....................
+..  LD_Direction  ..
+....................
+
 Get information about direction of agreement for any two lists of SNPs, based on https://github.com/CBIIT/nci-webtools-dceg-linkage
 
 This basically just wraps the LDpair.py tool from that repository, all rights are maintained by the original developers.

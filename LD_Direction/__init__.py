@@ -15,7 +15,7 @@ Original author (LDLink): Mitchell Machiela
 Organization: Stanford University
 License: MIT License, property of Stanford and NCI, use as you wish
 Created: 2017-21-21 10:04
-Version: 0.1a
+Version: 0.1.0a
 
 LDLink
 ------
@@ -31,7 +31,7 @@ Machiela MJ, Chanock SJ. LDlink a web-based application for exploring
 population-specific haplotype structure and linking correlated alleles of
 possible functional variants. Bioinformatics. 2015 Jul 2. PMID: 26139635.
 """
-__version__ = '0.1a'
+__version__ = '0.1.0a'
 
 # Make core functions easily available
 from . import snp_link
