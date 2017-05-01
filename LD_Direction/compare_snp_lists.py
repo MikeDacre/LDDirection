@@ -47,11 +47,106 @@ TODO
 import sys as _sys
 import argparse as _argparse
 
+import dbSNP as _dbSNP
+
+DB_PATH = '/godot/dbsnp'
+DB_VERS = 150
+
+
+class MissingSNPError(Exception):
+
+    """Exceception to catch missing SNPs."""
+
+    pass
+
+
+class BadSNPError(Exception):
+
+    """Exceception to catch missing SNPs."""
+
+    pass
+
 
 def comp_snp_lists(list1, list2, populations=None, r2=0.9, distance='50kb',
-                   output_table=False, return_dataframe=False):
+                   output_table=False, return_dataframe=False,
+                   raise_on_error=False):
     """Compare two SNP lists."""
-    pass
+    list1, list2 = lists_to_locs(list1, list2, raise_on_error)
+
+
+def lists_to_locs(list1, list2, raise_on_missing=False):
+    """Convert every entry in each list to a chr:loc position.
+
+    Uses a single large dbSNP lookup to create a dictionary and then parses
+    the two lists.
+    """
+    list1_rs = [i for i in list1 if i.startswith('rs')]
+    list2_rs = [i for i in list2 if i.startswith('rs')]
+    if list1_rs or list2_rs:
+        comb = set(list1_rs + list2_rs)
+        db = _dbSNP.DB(DB_PATH, DB_VERS)
+        rs_lookup = {
+            i[0]: '{}:{}'.format(i[1], i[2]+1) for i in db.query(
+                db.Row.name, db.Row.chrom, db.Row.start
+            ).filter(
+                db.Row.name.in_(comb)
+            )
+        }
+        failed = []
+        new_lst = []
+        for snp in list1:
+            if snp.startswith('rs'):
+                if snp not in rs_lookup:
+                    failed.append(snp)
+                new_lst.append(rs_lookup[snp])
+            else:
+                new_lst.append(snp)
+        list1 = new_lst
+        new_lst = []
+        for snp in list2:
+            if snp.startswith('rs'):
+                if snp not in rs_lookup:
+                    failed.append(snp)
+                new_lst.append(rs_lookup[snp])
+            else:
+                new_lst.append(snp)
+        list2 = new_lst
+        if failed:
+            err = (
+                'The following SNPs were not in the dbSNP db:\n{}'
+                .format(failed)
+            )
+            if raise_on_missing:
+                raise MissingSNPError(err)
+            _sys.stderr.write(err + '\n')
+    bad = []
+    new_lst = []
+    for snp in list1:
+        if ':' not in snp:
+            bad.append(snp)
+        chrom, loc = snp.split(':')
+        chrom = chrom if chrom.startswith('chr') else 'chr' + chrom
+        loc = int(loc)
+        new_lst.append('{}:{}'.format(chrom, loc))
+    list1 = new_lst
+    new_lst = []
+    for snp in list2:
+        if ':' not in snp:
+            bad.append(snp)
+        chrom, loc = snp.split(':')
+        chrom = chrom if chrom.startswith('chr') else 'chr' + chrom
+        loc = int(loc)
+        new_lst.append('{}:{}'.format(chrom, loc))
+    list2 = new_lst
+    if bad:
+        err = (
+            'The following parsed SNPs do not meet the format requirements:\n'
+            '{}'.format(bad) + '\nFormat should be "chr:pos"'
+        )
+        if raise_on_missing:
+            raise BadSNPError(err)
+        _sys.stderr.write(err + '\n')
+    return list1, list2
 
 
 def get_arg_parser():
