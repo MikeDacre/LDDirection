@@ -9,12 +9,14 @@ import os
 import sys
 import json
 import math
-import time
-import sqlite3
 import argparse
-import subprocess
+import subprocess as _sub
 
-DB_SNP_VER = '149'
+# https://github.com/MikeDacre/dbSNP
+import dbSNP
+
+DB_SNP_LOC = '/godot/dbsnp'
+DB_SNP_VER = 150
 
 POPULATIONS = ["ALL", "AFR", "AMR", "EAS", "EUR", "SAS", "ACB", "ASW", "BEB",
                "CDX", "CEU", "CHB", "CHS", "CLM", "ESN", "FIN", "GBR", "GIH",
@@ -40,9 +42,35 @@ def output_json(output):
 
 def run_cmnd(cmnd):
     """Run a command and return the output split into a list by newline."""
-    return subprocess.check_output(
-        cmnd, shell=True
-    ).decode().strip().split('\n')
+    output, _, _ = run(cmnd, raise_on_error=True)
+    return output.strip().split('\n')
+
+
+def run(command, raise_on_error=False):
+    """Run a command with subprocess the way it should be.
+
+    Parameters
+    ----------
+    command : str
+        A command to execute, piping is fine.
+    raise_on_error : bool
+        Raise a subprocess.CalledProcessError on exit_code != 0
+
+    Returns
+    -------
+    stdout : str
+    stderr : str
+    exit_code : int
+    """
+    pp = _sub.Popen(command, shell=True, universal_newlines=True,
+                    stdout=_sub.PIPE, stderr=_sub.PIPE)
+    out, err = pp.communicate()
+    code = pp.returncode
+    if raise_on_error and code != 0:
+        raise _sub.CalledProcessError(
+            returncode=code, cmd=command, output=out, stderr=err
+        )
+    return out, err, code
 
 
 def get_snp_info(snp):
@@ -74,19 +102,16 @@ def get_snp_info(snp):
     # Find RS numbers in dbSNP
     if snp.startswith('rs'):
         # Connect to snp database
-        conn = sqlite3.connect(SNP_DB)
-        conn.text_factory = str
-        cur = conn.cursor()
-
-        id = snp.strip("rs")
-        t = (id,)
-        cur.execute("SELECT * FROM tbl_" + id[-1] + " WHERE id=?", t)
-        snp_coord = cur.fetchone()
+        db = dbSNP.DB(DB_SNP_LOC, DB_SNP_VER)
+        snp_coord = db.lookup_rsids(snp)[0]
         if not snp_coord:
             raise SNP_Lookup_Failure('{} is not in dbSNP build {}.'
                                      .format(snp, DB_SNP_VER))
-        snp_chrom = d[1]
-        snp_loc = d[2]
+        if len(snp_coord) > 1:
+            raise SNP_Lookup_Failure('{} is an indel, not a SNP.'
+                                     .format(snp))
+        snp_chrom = snp_coord.chrom
+        snp_loc   = snp_coord.start + 1
     elif ':' in snp:
         snp_chrom, snp_loc = snp.split(':')
     else:
@@ -102,11 +127,21 @@ def get_snp_info(snp):
         .format(snp_chrom)
     )
     # Strip 'chr' from chromosome
-    tabix_cmd = "tabix {0} {1}:{2}-{2} | grep -v -e END".format(
+    tabix_cmd = "tabix {0} {1}:{2}-{2}".format(
         vcf_file, snp_chrom[3:], snp_loc
     )
-    vcf = run_cmnd(tabix_cmd)
-
+    err = None
+    try:
+        vcf = run_cmnd(tabix_cmd)
+    except _sub.CalledProcessError as e:
+        err = e
+        raise
+    if err:
+        raise SNP_Lookup_Failure(
+            'tabix 1000genomes lookup of {} failed\ncmnd: {}\nmessage:\n{}'
+            .format(snp, tabix_cmd, err.output)
+        )
+    vcf = [i for i in vcf if 'END' not in i]
     # Import SNP VCF files
     if len(vcf) == 0:
         raise SNP_Lookup_Failure(snp + " is not in 1000G reference panel.")
@@ -162,7 +197,7 @@ def calculate_pair(snp1, snp2, pops, write_summary=None, return_json=False):
     Parameters
     ----------
     snp1/snp2 : str
-        rsIDs to compare
+        rsIDs to compare can also be chr:location where location is base-1
     pops : list
         list of populations (e.g. YRI, ESN).
     write_summary : str
@@ -574,7 +609,7 @@ def print_summary(json_dict, outfile=None):
     return outstr
 
 
-def get_arg_parser(argv=None):
+def get_arg_parser():
     """Return command line parser."""
 
     parser  = argparse.ArgumentParser(
@@ -583,8 +618,8 @@ def get_arg_parser(argv=None):
     )
 
     # Positional arguments
-    parser.add_argument('snp1', help="First SNP (rsID or chr:pos)")
-    parser.add_argument('snp2', help="Second SNP (rsID or chr:pos)")
+    parser.add_argument('snp1', help="First SNP (rsID or chr:pos [base-1])")
+    parser.add_argument('snp2', help="Second SNP (rsID or chr:pos [base-1])")
     parser.add_argument('populations',
                         help="Comma separated list of populations")
     parser.add_argument('request', nargs='?',
