@@ -2,13 +2,24 @@
 LD_Direction
 ############
 
-Get information about direction of agreement for any two lists of SNPs, based on https://github.com/CBIIT/nci-webtools-dceg-linkage
+Get information about direction of agreement for any two lists of SNPs, based on `LDlink <https://github.com/CBIIT/nci-webtools-dceg-linkage>`_ and `plink <https://www.cog-genomics.org/plink>`_
 
-This basically just wraps the LDpair.py tool from that repository, all rights are maintained by the original developers.
+Compares every SNP in one list to each SNP in another:
+
+.. image:: LD_Direction_graphic.png
+
+Pairs are the filtered by distance on the genome and linkage disequilibrium. The filtered list includes phasing information, allowing instant lookup of the allele in one SNP given an allele in the other. Lookup for a single pair is also possible.
+
+The software works best used as a python library, but two scripts are provided also:
+
+- ``ldlists`` :  allows comparison of two SNP lists as described above
+- ``ldpair``  :  allows comparison of just one pair with a more detailed report than given by ``ldlists``
 
 To run this code, you will need a copy of a dbSNP sqlite database and a copy of all the 1000genomes VCF files.
 
 **Note**: Currently under development and unstable/unusable.
+
+The code can be used as 
 
 ...........
 Requirments
@@ -17,12 +28,33 @@ Requirments
 Code
 ====
 
-You will need a funtional version of PLINK 1.9: https://www.cog-genomics.org/plink
+To run ``ldlists`` you will need a funtional version of PLINK 1.9: https://www.cog-genomics.org/plink, to run ``ldpair`` you will need a functional version of tabix `htslib <https://github.com/samtools/htslib>`_
+
+I recommend installing both of these tools.
 
 Python Requirements
 -------------------
 
-All python requirements will be automatically downloaded when installing using the `setup.py` file
+All python requirements will be automatically downloaded when installing using the `setup.py` file.
+
+Essential requirements:
+
+- `Cython <http://cython.org/>`_
+- `dbSNP <https://github.com/MikeDacre/dbSNP>`_
+
+Required for table handling in `ldlists`:
+
+- `pandas <http://pandas.pydata.org/>`_
+
+Recommended for progress bars:
+
+- `tqdm <https://pypi.python.org/pypi/tqdm>`_
+
+Recommended if you have access to a torque or slurm cluster:
+
+- `fyrd <https://fyrd.science>`_
+
+All of the above except fyrd will be installed automatically, if you want to parallelize on a cluster, install and configure fyrd on your system.
 
 Data
 ====
