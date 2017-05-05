@@ -7,6 +7,8 @@ import codecs
 
 from setuptools import setup
 
+from Cython.Build import cythonize
+
 ###############################################################################
 #                     Build the things we need for setup                      #
 ###############################################################################
@@ -48,4 +50,5 @@ setup(
 
     install_requires=['tqdm', 'dbSNP', 'pandas'],
     packages=['LD_Direction'],
+    ext_modules = cythonize('LD_Direction/distance_filtering.pyx'),
 )

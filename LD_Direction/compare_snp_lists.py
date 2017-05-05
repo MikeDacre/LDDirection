@@ -51,11 +51,32 @@ TODO
 import os as _os
 import re as _re
 import sys as _sys
+import pickle as _pickle
+import subprocess as _sub
 import argparse as _argparse
+import multiprocessing as _mp
 from tempfile import mkstemp as _temp
 
+try:
+    import pandas as _pd
+except ImportError:
+    _pd = None
+
 import dbSNP as _dbSNP
-import subprocess as _sub
+
+try:
+    from tqdm import tqdm, tqdm_notebook
+    try:
+        if str(type(get_ipython())) == "<class 'ipykernel.zmqshell.ZMQInteractiveShell'>":
+            pb = tqdm_notebook
+        else:
+            pb = tqdm
+    except NameError:
+        pb = tqdm
+except ImportError:
+    pb = None
+
+from .distance_filtering import distance_filter
 
 DB_PATH = '/godot/dbsnp'
 DB_VERS = 150
@@ -104,10 +125,14 @@ def run(command, raise_on_error=False):
     out, err = pp.communicate()
     code = pp.returncode
     if raise_on_error and code != 0:
+        _sys.stderr.write(
+            '{}\nfailed with:\nCODE: {}\nSTDOUT:\n{}\nSTDERR:\n{}\n'
+            .format(command, code, out, err)
+        )
         raise _sub.CalledProcessError(
             returncode=code, cmd=command, output=out, stderr=err
         )
-    return out.decode(), err.decode(), code
+    return out, err, code
 
 
 class PLINK(object):
@@ -115,9 +140,19 @@ class PLINK(object):
     """A reusable object to run plink jobs quickly."""
 
     written_files = {}
+    bims = {}
 
-    def __init__(self, pop_file=None):
-        """Load population information."""
+    def __init__(self, pop_file=None, plink='plink'):
+        """Load population information.
+
+        Parameters
+        ----------
+        pop_file : str, optional
+            Path to the 1000 genomes population file
+        plink : str, optional
+            Path to plink executable, otherwise searches PATH
+        """
+        self.plink = plink
         if not pop_file:
             pop_file = _os.path.join(
                 DATA_DIR, 'integrated_call_samples_v3.20130502.ALL.panel'
@@ -134,19 +169,19 @@ class PLINK(object):
 
     def pop_file(self, populations=None):
         """Write temp file with a list of individuals in population."""
-        populations = populations if populations else individuals.keys()
+        populations = populations if populations else self.individuals.keys()
         if isinstance(populations, str):
             populations = [populations]
         populations = list(populations)
         if ','.join(populations) in self.written_files:
-            fl = self.written_files[populations]
+            fl = self.written_files[','.join(populations)]
             if _os.path.isfile(fl):
                 return fl
         pop_ids  = []
         bad_pops = []
         for pop_i in populations:
-            if pop_i in individuals:
-                pop_ids += individuals[pop_i]
+            if pop_i in self.individuals:
+                pop_ids += self.individuals[pop_i]
             else:
                 bad_pops.append(pop_i)
         if bad_pops:
@@ -160,12 +195,37 @@ class PLINK(object):
 
         _, file_location = _temp(prefix='-'.join(populations), dir='/tmp')
         with open(file_location, 'w') as outfile:
-            outfile.write('\n'.join(pop_ids))
+            outfile.write('\n'.join(
+                [' '.join(x) for x in zip(pop_ids, pop_ids)]
+            ))
 
         self.written_files[','.join(populations)] = file_location
         return file_location
 
-    def one_to_many(self, snp, comp_list, chrom, r2=0.9, populations=None):
+    def bim_snps(self, chrom):
+        """Return and cache all SNPs in a bim file."""
+        if chrom in self.bims:
+            with open(self.bims[chrom], 'rb') as fin:
+                return _pickle.load(fin)
+        bfile = _os.path.join(
+            DATA_DIR,
+            'ALL.{}.phase3_shapeit2_mvncall_integrated_v5a.20130502.genotypes'
+            .format(chrom)
+        )
+        bim = bfile + '.bim'
+        rsids = []
+        with open(bim) as fin:
+            for line in fin:
+                rsids.append(line.split('\t')[1])
+        rsids = frozenset(rsids)
+        _, pfl = _temp()
+        with open(pfl, 'wb') as fout:
+            _pickle.dump(rsids, fout)
+        self.bims[chrom] = pfl
+        return rsids
+
+    def one_to_many(self, snp, comp_list, chrom, r2=0.6, populations=None,
+                    raise_on_error=False, logfile=_sys.stderr):
         """Get one-to-many LD information using plink.
 
         Parameters
@@ -176,181 +236,105 @@ class PLINK(object):
             list of rsIDs to compare to
         chrom : str
             which chromosome to search
-        r2 : float
+        r2 : float, optional
             r-squared level to use for filtering
-        populations : list_of_str
+        populations : list_of_str, optional
             list of populations to include in the analysis
+        raise_on_error : bool, optional
+            if False, will return None if primary SNP missing from bim file
+        logfile : filehandle, optional
+            A file like object to write to
 
         Returns
         -------
-        matching_snps
+        matching_snps : dict
             For every matching SNP that beats the r-squared: {
                 snp: {r2: r-squared, dprime: d-prime, phased: phased-alleles}
             }
+            If plink job fails, returns an empty dictionary.
         """
         _, temp_file = _temp(prefix='plink', dir='/tmp')
         pop_file = self.pop_file(populations)
+        bfile = _os.path.join(
+            DATA_DIR,
+            'ALL.{}.phase3_shapeit2_mvncall_integrated_v5a.20130502.genotypes'
+            .format(chrom)
+        )
+        bim = bfile + '.bim'
         # We need to include the query SNP in the lookup list
+        comp_list = list(comp_list)
         comp_list.append(snp)
         comp_list = sorted(set(comp_list))
+        # Filter SNPs not in the bim
+        bim_snps = self.bim_snps(chrom)
+        bad = []
+        if snp not in bim_snps:
+            err = ('Primary SNP {} is not in BIM {}, cannot continue.'
+                   .format(snp, bim))
+            if raise_on_error:
+                raise BadSNPError(err)
+            else:
+                logfile.write(err + '\n')
+                return None
+        bad = []
+        for s in comp_list:
+            if snp not in bim_snps:
+                bad.append(s)
+                comp_list.remove(s)
+        del(bim_snps)
         # Build the command
         plink_cmnd = (
             '{plink} --bfile {bfile} --r2 in-phase dprime --ld-snp {snp} '
             '--snps {comp_list} --keep {ind_file} --out {tmp}'
         ).format(
-            plink='plink',
-            bfile=_os.path.join(
-                DATA_DIR,
-                'ALL.{}.phase3_shapeit2_mvncall_integrated_v5a.20130502.genotypes'.format(chrom)
-            ),
-            snp=snp, comp_list=' '.join(comp_list), pop_file=pop_file,
-            tmp=temp_file
+            plink=self.plink,
+            bfile=bfile,
+            snp=snp, comp_list=' '.join(comp_list),
+            ind_file=pop_file, tmp=temp_file
         )
         # Run it
-        run(plink_cmnd, True)
+        stdout, stderr, code = run(plink_cmnd, raise_on_error)
         # Parse the output file
+        if code != 0:
+            logfile.write(
+                '{}: plink command failed'.format(snp) +
+                'Command: {}\nExit Code: {}\nSTDOUT:\n{}\bSTDERR:\n{}\n'
+                .format(plink_cmnd, code, stdout, stderr)
+            )
+            return {}
         results = {}
         with open(temp_file + '.ld') as fin:
+            # Check header
+            line = fin.readline().strip()
+            assert _re.split(r' +', line) == [
+                'CHR_A', 'BP_A', 'SNP_A', 'CHR_B', 'BP_B',
+                'SNP_B', 'PHASE', 'R2', 'DP'
+            ]
             for line in fin:
                 f = _re.split(r' +', line.strip())
-                snp2, phased, rsquared, dprime = f[5], f[6], f[7], f[8]
+                snp2, phased = f[5], f[6]
+                rsquared, dprime = float(f[7]), float(f[8])
                 if snp2 == snp:
                     continue
+                if rsquared < r2:
+                    continue
+                try:
+                    p1, p2 = phased.split('/')
+                    s1a, s2a = p1
+                    s1b, s2b = p2
+                    lookup = {snp:  {s1a: s2a, s1b: s2b},
+                              snp2: {s2a: s1a, s2b: s1b}}
+                except ValueError:
+                    lookup = {}
                 results[snp2] = {'r2': rsquared, 'dprime': dprime,
-                                    'phased': phased}
+                                 'phased': phased, 'lookup': lookup}
         _os.remove(temp_file + '.ld')
         return results
 
 
-# Primary function
-def comp_snp_lists(list1, list2, populations=None, r2=0.9, distance='50kb',
-                   return_dataframe=False, raise_on_error=False):
-    """Compare two SNP lists, filter by r2.
-
-    Runs a dbSNP lookup to get rsID and location information for all SNPs in
-    list1 and list2, then creates pairs of SNPs: for every SNP in list1, create
-    a pair with every SNP in list2 within 'distance'. Then, do a one-to-many
-    LD comparison with plink for every snp-list combination. This calculation
-    is filtered by population.
-
-    Parameters
-    ----------
-    list1/list2 : list_of_str
-        list of rsIDs and chr:pos (where pos is base-1)
-    populations : list_of_str
-        list of 1000genomes populations, if not provided, all possible
-        populations are used. This list is used for the LD calculations and
-        limits the individuals considered in the LD calculation.
-    r2 : float
-        An r-squared cutoff to use for filtering
-    distance : str_or_int
-        A distance away from a SNP in list1 to consider SNPs in list2, can be
-        a integer of bases or a string with a suffix kb (kilo-bases) or mb
-        (mega-bases)
-    return_dataframe : bool
-        Return a dataframe instead of a list of SNP_Link objects
-    raise_on_error : bool, optional
-        Raise an Exception if there is a problem with any of the SNPs in the
-        list, otherwise errors are silently ignored.
-
-    Returns
-    -------
-    dict_or_DataFrame
-        If return_dataframe is True, then a DataFrame is built and returned
-        otherwise a dictionary of {SNP: [SNP_Link, ...]}.
-    """
-    snps1 = list_to_rsid_and_locs(list1, raise_on_error)
-    snps2 = list_to_rsid_and_locs(list2, raise_on_error)
-    pairs = create_pairs(snps1, snps2)
-    pairs = filter_pairs(pairs, r2, populations)
-
-
-def filter_pairs(pairs, r2=0.9, populations=None):
-    """Use plink to lookup LD and filter lists by the r2."""
-    plink = PLINK()
-    run_lists = {}
-    for chrom, data in pairs.items():
-        run_lists[chrom] = {}
-        for snp, info in data.items():
-            if info['matches']:
-                run_lists[chrom][snp] = info['matches']
-    results = {}
-    for chrom, snps in run_lists.items():
-        for snp, comp_list in snps.items():
-            results[snp] = plink.one_to_many(
-                snp, comp_list, chrom, r2, populations
-            )
-    # Add all data back again
-    filtered = {}
-    for chrom, data in pairs.items():
-        for snp, info in data.items():
-            filtered[snp] = {'loc': info['loc']}
-            if info['matches']:
-                filtered[snp]['matches'] = {}
-                for snp2, pos2 in info['matches']:
-                    if snp2 in results[snp]:
-                        filtered[snp]['matches'][snp2] = results[snp][snp2]
-                        filtered[snp]['matches'][snp2]['loc'] = pos2
-    return filtered
-
-
-def create_pairs(list1, list2, distance='50kb'):
-    """Create a dictionary of pairwise combinations from list1 and list2.
-
-    For every SNP in list1, checks all SNPs in list2 to see which are within
-    distance of SNP1.
-
-    Parameters
-    ----------
-    list1/list2 : list_of_tuples
-        lists from list_to_rsid_and_locs() in the format:
-        [(rsid, chromosome, int(position))]  # position is base-1
-    distance : str_or_int
-        A distance away from a SNP in list1 to consider SNPs in list2, can be
-        a integer of bases or a string with a suffix kb (kilo-bases) or mb
-        (mega-bases)
-
-    Returns
-    -------
-    dict
-        A dictionary of {chrom:
-            SNP1: {
-                loc: position,
-                matches: [(snp2, position2), ...]
-            }
-        }
-    """
-    if isinstance(distance, str):
-        dist, mod = _re.match(r'(\d+)(\D+)', '50kb').groups()
-        dist = int(dist)
-        mod = mod.lower()
-        if not mod in ['kb', 'mb']:
-            raise ValueError('Cannot parse {}, must be in kb or mb only'
-                             .format(distance))
-        if mod == 'kb':
-            dist = dist * 1000
-        elif mod == 'mb':
-            dist = dist * 1000000
-    # Covert list2 to a dictionary for speed
-    dict2 = {}
-    for name, chrom, loc in list2:
-        if chrom not in dict2:
-            dict2[chrom] = []
-        dict2[chrom].append((loc, name))
-    results = {}
-    for snp1, chrom1, pos1 in list1:
-        if chrom1 not in results:
-            results[chrom1] = {}
-        results[chrom1][snp1] = {'loc': pos1, 'matches': []}
-        if chrom1 not in dict2:
-            continue
-        for pos2, snp2 in dict2[chrom1]:
-            if snp1 == snp2:
-                continue
-            if abs(pos2 - pos1) > dist:
-                continue
-            results[chrom1][snp1]['matches'].append((snp2, pos2))
-    return results
+###############################################################################
+#                              dbSNP Connection                               #
+###############################################################################
 
 
 def list_to_rsid_and_locs(list1, raise_on_missing=False):
@@ -379,8 +363,8 @@ def list_to_rsid_and_locs(list1, raise_on_missing=False):
 
     Returns
     -------
-    list_of_tuples
-        [(rsid, chromosome, int(position))]  # position is base-1
+    dict_of_lists
+        {'chrom': [(rsid, int(position))]}  # position is base-1
     """
     list1_rs = []
     list1_locs = []
@@ -395,7 +379,7 @@ def list_to_rsid_and_locs(list1, raise_on_missing=False):
     if bad:
         err = (
             'The following SNPs fail format requirements:\n{}'
-            .format(failed)
+            .format(bad)
         )
         if raise_on_missing:
             raise MissingSNPError(err)
@@ -415,36 +399,250 @@ def list_to_rsid_and_locs(list1, raise_on_missing=False):
     if list1_locs:
         db = _dbSNP.DB(DB_PATH, DB_VERS)
         query = {}
-        for chrom, loc in list1_locs.split(':'):
+        for chrom, loc in [i.split(':') for i in list1_locs]:
             if chrom not in query:
                 query[chrom] = []
             query[chrom].append(int(loc-1))
         loc_lookup = {
-            '{}:{}'.format(i.chrom, i.start+1): (i.name, i.chrom, i.start)
+            '{}:{}'.format(i.chrom, i.start+1): (i.name, i.chrom, i.start+1)
             for i in db.lookup_locations(query)
             if not i.end-i.start > 1
         }
 
-    failed = []
-    new_lst = []
+    failed  = []
+    results = {}
     for snp in list1:
         if snp.startswith('rs'):
             if not snp in rs_lookup:
-                err = '{} not in dbSNP'.format(snp)
-                if raise_on_missing:
-                    raise MissingSNPError(err)
-                else:
-                    sys.stderr.write(err + '\n')
-            new_lst.append(rs_lookup[snp])
+                failed.append(snp)
+                continue
+            s_rs, s_chrom, s_loc = rs_lookup[snp]
         elif ':' in snp:
             if not snp in loc_lookup:
-                err = '{} not in dbSNP'.format(snp)
-                if raise_on_missing:
-                    raise MissingSNPError(err)
-                else:
-                    sys.stderr.write(err + '\n')
-            new_lst.append(loc_lookup[snp])
-    return new_lst
+                failed.append(snp)
+                continue
+            s_rs, s_chrom, s_loc = loc_lookup[snp]
+        if s_chrom not in results:
+            results[s_chrom] = []
+        results[s_chrom].append((s_rs, s_loc))
+    if failed:
+        err = '{} not in dbSNP'.format(snp)
+        if raise_on_missing:
+            raise MissingSNPError(err)
+        else:
+            _sys.stderr.write(err + '\n')
+    return results
+
+
+###############################################################################
+#                             Filtering Functions                             #
+###############################################################################
+
+
+def filter_by_distance(ref_snps, comp_snps, distance='50kb', cores=None):
+    """Create a dictionary of pairwise combinations from list1 and list2.
+
+    For every SNP in ref_snps, checks all SNPs in comp_snps to see which are
+    within distance of SNP1.
+
+    Parameters
+    ----------
+    ref_snps/comp_snps : dict_of_lists
+        In the format: {chrom: [(rsid, location), ...]} where location is
+        base-1. This format is output by list_to_rsid_and_locs().
+    distance : str_or_int, optional
+        A distance away from a SNP in list1 to consider SNPs in list2, can be
+        a integer of bases or a string with a suffix kb (kilo-bases) or mb
+        (mega-bases)
+    cores : int, optional
+        How many cores to use, default is all
+
+    Returns
+    -------
+    dict
+        A dictionary of {chrom:
+            SNP1: {
+                loc: position,
+                matches: [(snp2, position2), ...]
+            }
+        }
+    """
+    # Calculate distance
+    if isinstance(distance, str):
+        dist, mod = _re.match(r'(\d+)(\D+)', '50kb').groups()
+        dist = int(dist)
+        mod = mod.lower()
+        if not mod in ['kb', 'mb']:
+            raise ValueError('Cannot parse {}, must be in kb or mb only'
+                             .format(distance))
+        if mod == 'kb':
+            dist = dist * 1000
+        elif mod == 'mb':
+            dist = dist * 1000000
+
+    results = {}
+    for chrom, snps in ref_snps.items():
+        results[chrom] = distance_filter(snps, comp_snps[chrom], dist)
+
+    return results
+
+
+def filter_by_ld(pairs, r2=0.6, populations=None, plink='plink'):
+    """Use plink to lookup LD and filter lists by the r2.
+
+    Parameters
+    ----------
+    r2 : float
+        An r-squared cutoff to use for filtering
+    distance : str_or_int
+        A distance away from a SNP in list1 to consider SNPs in list2, can be
+        a integer of bases or a string with a suffix kb (kilo-bases) or mb
+        (mega-bases)
+    plink : str, optional
+        Path to plink executable, otherwise searches PATH
+
+    """
+    plink = PLINK(plink=plink)
+    results = {}
+    for chrom, snps in pairs.items():
+        print('Working on chromosome {}'.format(chrom))
+        results[chrom] = {}
+        it = pb(snps, unit='plink_calculations') if pb else snps.items()
+        for snp, _, comp_list in it:
+            if not comp_list:
+                continue
+            comp_snps = [rsid for rsid, loc in comp_list]
+            results[chrom][snp] = plink.one_to_many(
+                snp, comp_snps, chrom, r2, populations, raise_on_error=False,
+                logfile=it
+            )
+    # Add all data back again
+    filtered = {}
+    for chrom, data in pairs.items():
+        for snp, loc, comp_list in data:
+            filtered[snp] = {'loc': loc, 'chrom': chrom}
+            if snp in results[chrom]:
+                if results[chrom][snp]:
+                    filtered[snp]['matches'] = {}
+                    for snp2, pos2 in comp_list:
+                        if snp2 in results[chrom][snp]:
+                            filtered[snp]['matches'][snp2] = results[chrom][snp][snp2]
+                            filtered[snp]['matches'][snp2]['loc'] = pos2
+    return filtered
+
+
+###############################################################################
+#                          Output Parsing Functions                           #
+###############################################################################
+
+
+def pairs_to_dataframe(pairs):
+    """Convert output of filter_by_ld() to a dataframe."""
+    if not _pd:
+        raise ImportError('pandas is not available')
+    header = ['SNP', 'Chrom', 'Location', 'Match', 'Match_Loc',
+              'SNP1_A1', 'SNP1_A2', 'SNP2_A1', 'SNP2_A2',
+              'R2', 'Dprime', 'SNP1_A1_Pair']
+    rows  = []
+    index = []
+    for snp1, data in pairs.items():
+        cols = [snp1, data['chrom'], data['loc']]
+        for snp2, info in data['matches'].items():
+            s1_alleles = sorted(info['lookup'][snp1])
+            s2_alleles = [info['lookup'][snp1][i] for i in s1_alleles]
+            rcols = [
+                snp2, info['loc'],
+                s1_alleles[0], s1_alleles[1], s2_alleles[0], s2_alleles[1],
+                info['r2'], info['dprime'], s2_alleles[0]
+            ]
+            rows.append(cols + rcols)
+            index.append('{}:{}'.format(snp1, snp2))
+    return _pd.DataFrame(rows, columns=header, index=index)
+
+
+###############################################################################
+#                     Primary Function to Run Everything                      #
+###############################################################################
+
+
+def comp_snp_lists(list1, list2, populations=None, r2=0.6, distance='50kb',
+                   plink='plink', return_dataframe=False, return_snplink,
+                   raise_on_error=False):
+    """Compare two SNP lists, filter by r2.
+
+    Runs a dbSNP lookup to get rsID and location information for all SNPs in
+    list1 and list2, then creates pairs of SNPs: for every SNP in list1, create
+    a pair with every SNP in list2 within 'distance'. Then, do a one-to-many
+    LD comparison with plink for every snp-list combination. This calculation
+    is filtered by population.
+
+    Parameters
+    ----------
+    list1/list2 : list_of_str
+        list of rsIDs and chr:pos (where pos is base-1)
+    populations : list_of_str
+        list of 1000genomes populations, if not provided, all possible
+        populations are used. This list is used for the LD calculations and
+        limits the individuals considered in the LD calculation.
+    r2 : float
+        An r-squared cutoff to use for filtering
+    distance : str_or_int
+        A distance away from a SNP in list1 to consider SNPs in list2, can be
+        a integer of bases or a string with a suffix kb (kilo-bases) or mb
+        (mega-bases)
+    plink : str, optional
+        Path to plink executable, otherwise searches PATH
+    return_dataframe : bool, optional
+        Return a dataframe instead of JSON
+    return_snplink : bool, optional
+        Return a dictionary of SNP_Link objects
+    raise_on_error : bool, optional
+        Raise an Exception if there is a problem with any of the SNPs in the
+        list, otherwise errors are silently ignored.
+
+    Returns
+    -------
+    JSON : dict
+        If return_dataframe and return_snppairs are False, a json-style
+        dictionary is returned with the format:
+            {snp1: {chrom: chrX, loc: #, matches:
+                {snp2: {loc: #, r2: float, dprime: float, phased: AT/GC,
+                        lookup: {snp1: {S1A1: S2A1, ..}, snp2: {..}}}}
+            }}
+    DataFrame : pandas.DataFrame
+        If return_dataframe is True, then a DataFrame is built and returned
+        with the rows:
+            SNP, Chrom, Location, Match, Match_Loc, SNP1_A1, SNP1_A2,
+            SNP2_A1, SNP2_A2, R2, Dprime, SNP1_A1_Pair
+        The SNPs are in order, so SNP1_A1 occurs with SNP2_A2, etc.
+    SNP_Links : dict_of_SNP_Link
+        If return_snplink is True, a dictionary of SNP_Link objects is returned
+            {snp1: [SNP_Link, SNP_Link, ...]}
+    """
+    print('Getting SNP info for list1')
+    snps1 = list_to_rsid_and_locs(list1, raise_on_error)
+    print('Getting SNP info for list2')
+    snps2 = list_to_rsid_and_locs(list2, raise_on_error)
+    print('Getting all possible pairs within {}'.format(distance))
+    pairs = filter_by_distance(snps1, snps2, distance=distance)
+    l = 0
+    for v in pairs.values():
+        for i in [i[2] for i in v]:
+            l += len(i)
+    print('Running plink filters on {} calculations'.format(l))
+    pairs = filter_by_ld(pairs, r2, populations=populations, plink=plink)
+    print('Done')
+    if return_dataframe:
+        return pairs_to_dataframe(pairs)
+    if return_snplink:
+        pass
+    return pairs
+
+
+###############################################################################
+#                               Run as a Script                               #
+###############################################################################
+
 
 def get_arg_parser():
     """Create an argument parser."""
@@ -493,7 +691,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if not args.outfile and args.pandas:
-        __sys.stderr.write('Cannot write pandas DataFrame to STDOUT\n')
+        _sys.stderr.write('Cannot write pandas DataFrame to STDOUT\n')
         return 1
 
     with open(args.list1) as fin:
@@ -506,16 +704,13 @@ def main(argv=None):
     else:
         pops = None
 
-    if args.pandas:
-        table_args = {'output_table': None, 'return_dataframe': True}
-    else:
-        table_args = {'output_table': args.outfile, 'return_dataframe': False}
-
-    out = comp_snp_lists(list1, list2, populations, r2=float(args.r2),
-                         distance=args.distance, **table_args)
+    out = comp_snp_lists(list1, list2, pops, r2=float(args.r2),
+                         distance=args.distance, return_dataframe=True)
 
     if args.pandas:
         out.to_pickle(args.outfile)
+    else:
+        out.to_csv(args.outfile, sep='\t')
 
 if __name__ == '__main__' and '__file__' in globals():
     _sys.exit(main())
