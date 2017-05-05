@@ -1,6 +1,6 @@
-####################
-##  LD_Direction  ##
-####################
+############
+LD_Direction
+############
 
 Get information about direction of agreement for any two lists of SNPs, based on https://github.com/CBIIT/nci-webtools-dceg-linkage
 
@@ -10,9 +10,9 @@ To run this code, you will need a copy of a dbSNP sqlite database and a copy of 
 
 **Note**: Currently under development and unstable/unusable.
 
-...................
-..  Requirments  ..
-...................
+...........
+Requirments
+...........
 
 Code
 ====
@@ -39,7 +39,7 @@ ftp://ftp.1000genomes.ebi.ac.uk/vol1/ftp/release/20130502.
 
 To convert to plink, you will need to run the following commands on every file:
 
-.. highlight:: shell
+.. code:: shell
 
   i=ALL.chr6.phase3_shapeit2_mvncall_integrated_v5a.20130502.genotypes.vcf.gz;
   j=$(echo $i | sed 's/.vcf.gz//');
@@ -48,7 +48,7 @@ To convert to plink, you will need to run the following commands on every file:
 
 To run these on every file:
 
-.. highlight:: shell
+.. code:: shell
 
   for i in ALL.chr*.vcf.gz; do
     j=$(echo $i | sed 's/.vcf.gz//');
