@@ -379,16 +379,16 @@ def calculate_pair(snp1, snp2, pops, write_summary=None, return_json=False):
     if r2 != "NA" and r2 > 0.1:
 
         # Expected Cell Counts
-        eA = (A + B) * (A + C) / N
-        eB = (B + A) * (B + D) / N
-        eC = (C + A) * (C + D) / N
-        eD = (D + C) * (D + B) / N
+        eA = int((A + B) * (A + C) / N)
+        eB = int((B + A) * (B + D) / N)
+        eC = int((C + A) * (C + D) / N)
+        eD = int((D + C) * (D + B) / N)
 
         # Calculate Deltas
-        dA = (A - eA)**2
-        dB = (B - eB)**2
-        dC = (C - eC)**2
-        dD = (D - eD)**2
+        dA = int((A - eA)**2)
+        dB = int((B - eB)**2)
+        dC = int((C - eC)**2)
+        dD = int((D - eD)**2)
         dmax = max(dA, dB, dC, dD)
 
         outstr = "{} ({}) allele is correlated with {} ({})"
