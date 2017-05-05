@@ -55,6 +55,8 @@ import pickle as _pickle
 import subprocess as _sub
 import argparse as _argparse
 import multiprocessing as _mp
+import bz2 as _bz2
+import gzip as _gzip
 from tempfile import mkstemp as _temp
 
 try:
@@ -63,6 +65,8 @@ except ImportError:
     _pd = None
 
 import dbSNP as _dbSNP
+
+from .snp_link import SNP_Pair
 
 try:
     from tqdm import tqdm, tqdm_notebook
@@ -133,6 +137,22 @@ def run(command, raise_on_error=False):
             returncode=code, cmd=command, output=out, stderr=err
         )
     return out, err, code
+
+
+def _chrom_sort(x):
+    """Return an integer for sorting from a chromosome."""
+    if x.startswith('chr'):
+        x = x[3:]
+    if x.upper() == 'X':
+        return 100
+    elif x.upper() == 'Y':
+        return 101
+    elif x.upper().startswith('M'):
+        return 150
+    elif x.isdigit():
+        return int(x)
+    else:
+        return x
 
 
 class PLINK(object):
@@ -350,6 +370,9 @@ def list_to_rsid_and_locs(list1, raise_on_missing=False):
     ----------
     list1 : list_of_str
         list of rsIDs and chr:pos (where pos is base-1)
+        Note, itmes can also be a three-tuple:
+            (rsid, chrom, loc)
+        In this format, no lookup is performed, so function runs very fast.
     raise_on_missing : str
         Raise an Exception if there is a problem with any of the SNPs (i.e.
         they aren't in dbSNP or are indels
@@ -368,9 +391,20 @@ def list_to_rsid_and_locs(list1, raise_on_missing=False):
     """
     list1_rs = []
     list1_locs = []
+    list1_done = {}
     bad = []
     for snp in list1:
-        if snp.startswith('rs'):
+        if isinstance(snp, str) and '\t' in snp:
+            snp = snp.strip().split('\t')
+        if isinstance(snp, (list, tuple)):
+            if not len(snp) == 3:
+                bad.append(snp)
+            else:
+                rsid, chrom, loc = snp
+                chrom = chrom if chrom.startswith('chr') else 'chr' + chrom
+                loc   = int(loc)
+                list1_done[rsid] = (chrom, loc)
+        elif snp.startswith('rs'):
             list1_rs.append(snp)
         elif ':' in snp:
             list1_locs.append(snp)
@@ -386,6 +420,7 @@ def list_to_rsid_and_locs(list1, raise_on_missing=False):
         _sys.stderr.write(err + '\n')
 
     if list1_rs:
+        _sys.stderr.write('Doing rsID DB lookup.\n')
         db = _dbSNP.DB(DB_PATH, DB_VERS)
         rs_lookup = {
             i[0]: (i[0], i[1], i[2]+1) for i in db.query(
@@ -397,6 +432,7 @@ def list_to_rsid_and_locs(list1, raise_on_missing=False):
         }
 
     if list1_locs:
+        _sys.stderr.write('Doing position DB lookup.\n')
         db = _dbSNP.DB(DB_PATH, DB_VERS)
         query = {}
         for chrom, loc in [i.split(':') for i in list1_locs]:
@@ -411,8 +447,16 @@ def list_to_rsid_and_locs(list1, raise_on_missing=False):
 
     failed  = []
     results = {}
+    done = []
     for snp in list1:
-        if snp.startswith('rs'):
+        if isinstance(snp, str) and '\t' in snp:
+            snp = snp.strip().split('\t')
+        if isinstance(snp, (list, tuple)):
+            if not snp[0] in list1_done:
+                failed.append(snp[0])
+            s_rs = snp[0]
+            s_chrom, s_loc = list1_done[s_rs]
+        elif snp.startswith('rs'):
             if not snp in rs_lookup:
                 failed.append(snp)
                 continue
@@ -424,6 +468,9 @@ def list_to_rsid_and_locs(list1, raise_on_missing=False):
             s_rs, s_chrom, s_loc = loc_lookup[snp]
         if s_chrom not in results:
             results[s_chrom] = []
+        if s_rs in done:
+            continue
+        done.append(s_rs)
         results[s_chrom].append((s_rs, s_loc))
     if failed:
         err = '{} not in dbSNP'.format(snp)
@@ -432,6 +479,76 @@ def list_to_rsid_and_locs(list1, raise_on_missing=False):
         else:
             _sys.stderr.write(err + '\n')
     return results
+
+
+def save_list(snp_list, outfile=None, pickle=False):
+    """Convert a list of rsIDs or positions to a pre-processed format.
+
+    Converts either rsID or chr:loc (in base-1) style SNP locations into
+    (rsid, chrom, loc) (also base-1) to make future lookups faster.
+
+    Parameters
+    ----------
+    snp_list : list_of_str
+        list of rsIDs and chr:pos (where pos is base-1)
+        Note, itmes can also be a three-tuple:
+            (rsid, chrom, loc)
+    outfile : str, optional
+        A file to write the output to.
+    pickle : bool, optional
+        Write the tuple list as a pickled object instead of text.
+
+    Returns
+    -------
+    list
+        A list of (rsid, chrom, loc)
+
+    Writes
+    ------
+    rsid\tchrom\tloc
+    """
+    _sys.stderr.write('Parsing input list.\n')
+    parsed_list = list_to_rsid_and_locs(snp_list)
+    _sys.stderr.write('Done.\n')
+    output = []
+    for chrom, info in parsed_list.items():
+        for rsid, loc in info:
+            output.append((rsid, chrom, loc))
+    if outfile:
+        _sys.stderr.write('Writing output.\n')
+        if pickle:
+            with open_zipped(outfile, 'wb') as fout:
+                _pickle.dump(output, fout)
+        else:
+            with open_zipped(outfile, 'w') as fout:
+                for row in output:
+                    rsid, chrom, loc = row
+                    fout.write('{}\t{}\t{}\n'.format(rsid, chrom, loc))
+    return output
+
+
+def open_zipped(infile, mode='r'):
+    """Return file handle of file regardless of compressed or not.
+
+    Also returns already opened files unchanged, text mode automatic for
+    compatibility with python2.
+    """
+    # Return already open files
+    if hasattr(infile, 'write'):
+        return infile
+    # Make text mode automatic
+    if len(mode) == 1:
+        mode = mode + 't'
+    if not isinstance(infile, str):
+        raise ValueError("I cannot open a filename that isn't a string.")
+    if infile.endswith('.gz'):
+        return _gzip.open(infile, mode)
+    if infile.endswith('.bz2'):
+        if hasattr(_bz2, 'open'):
+            return _bz2.open(infile, mode)
+        else:
+            return _bz2.BZ2File(infile, mode)
+    return open(infile, mode)
 
 
 ###############################################################################
@@ -504,7 +621,8 @@ def filter_by_ld(pairs, r2=0.6, populations=None, plink='plink'):
     """
     plink = PLINK(plink=plink)
     results = {}
-    for chrom, snps in pairs.items():
+    for chrom in sorted(pairs, key=_chrom_sort):
+        snps = pairs[chrom]
         print('Working on chromosome {}'.format(chrom))
         results[chrom] = {}
         it = pb(snps, unit='plink_calculations') if pb else snps.items()
@@ -547,6 +665,8 @@ def pairs_to_dataframe(pairs):
     index = []
     for snp1, data in pairs.items():
         cols = [snp1, data['chrom'], data['loc']]
+        if not 'matches' in data:
+            continue
         for snp2, info in data['matches'].items():
             s1_alleles = sorted(info['lookup'][snp1])
             s2_alleles = [info['lookup'][snp1][i] for i in s1_alleles]
@@ -557,7 +677,32 @@ def pairs_to_dataframe(pairs):
             ]
             rows.append(cols + rcols)
             index.append('{}:{}'.format(snp1, snp2))
-    return _pd.DataFrame(rows, columns=header, index=index)
+    return _pd.DataFrame(rows, columns=header, index=index).sort_values(
+        ['Chrom', 'Location'])
+
+
+def pairs_to_SNP_Pairs(pairs, populations):
+    """Convert output of filter_by_ld() to dict of SNP_Pairs."""
+    results = {}
+    for snp1, info in pairs.items():
+        results[snp1] = []
+        if info['matches']:
+            for snp2, data in info['matches'].items():
+                results[snp1].append(
+                    SNP_Pair(
+                        plink = {
+                            snp1: {
+                                'chrom': info['chrom'],
+                                'loc' : info['loc'],
+                                'matches': {
+                                    snp2: data
+                                }
+                            }
+                        },
+                        populations = populations
+                    )
+                )
+    return results
 
 
 ###############################################################################
@@ -566,7 +711,7 @@ def pairs_to_dataframe(pairs):
 
 
 def comp_snp_lists(list1, list2, populations=None, r2=0.6, distance='50kb',
-                   plink='plink', return_dataframe=False, return_snplink,
+                   plink='plink', return_dataframe=False, return_snppair=False,
                    raise_on_error=False):
     """Compare two SNP lists, filter by r2.
 
@@ -578,8 +723,12 @@ def comp_snp_lists(list1, list2, populations=None, r2=0.6, distance='50kb',
 
     Parameters
     ----------
-    list1/list2 : list_of_str
+    list1/list2 : list_of_str or list_of_tuple
         list of rsIDs and chr:pos (where pos is base-1)
+        Can also be a list of three-tuples in the format:
+            (str(rsid), str(chrom), int(loc))
+        In this form, no database lookup is performed, making the query much
+        faster and removing the need to the SNP to be in dbSNP.
     populations : list_of_str
         list of 1000genomes populations, if not provided, all possible
         populations are used. This list is used for the LD calculations and
@@ -594,7 +743,7 @@ def comp_snp_lists(list1, list2, populations=None, r2=0.6, distance='50kb',
         Path to plink executable, otherwise searches PATH
     return_dataframe : bool, optional
         Return a dataframe instead of JSON
-    return_snplink : bool, optional
+    return_snppair : bool, optional
         Return a dictionary of SNP_Link objects
     raise_on_error : bool, optional
         Raise an Exception if there is a problem with any of the SNPs in the
@@ -615,9 +764,9 @@ def comp_snp_lists(list1, list2, populations=None, r2=0.6, distance='50kb',
             SNP, Chrom, Location, Match, Match_Loc, SNP1_A1, SNP1_A2,
             SNP2_A1, SNP2_A2, R2, Dprime, SNP1_A1_Pair
         The SNPs are in order, so SNP1_A1 occurs with SNP2_A2, etc.
-    SNP_Links : dict_of_SNP_Link
+    SNP_Pairs : dict_of_SNP_Pairs
         If return_snplink is True, a dictionary of SNP_Link objects is returned
-            {snp1: [SNP_Link, SNP_Link, ...]}
+            {snp1: [SNP_Pair, SNP_Pair, ...]}
     """
     print('Getting SNP info for list1')
     snps1 = list_to_rsid_and_locs(list1, raise_on_error)
@@ -634,8 +783,8 @@ def comp_snp_lists(list1, list2, populations=None, r2=0.6, distance='50kb',
     print('Done')
     if return_dataframe:
         return pairs_to_dataframe(pairs)
-    if return_snplink:
-        pass
+    if return_snppair:
+        return pairs_to_SNP_Pairs(pairs, populations=populations)
     return pairs
 
 
@@ -643,40 +792,116 @@ def comp_snp_lists(list1, list2, populations=None, r2=0.6, distance='50kb',
 #                               Run as a Script                               #
 ###############################################################################
 
+analyze_usage = """\
+ldlists analyze --r2 0.8 --distance 100kb snp_list comp_list [outfile]
+"""
+
+pre_usage = """\
+ldlists preprocess snp_list [outfile]
+"""
+
+general_usage = """
+General Usage
+-------------
+ldlists [--help] <mode> <options> snp_list [comp_list] [outfile]
+
+Examples
+--------
+ldlists --help  # Prints detail about algorithm
+{}
+{}
+
+""".format(analyze_usage.strip(), pre_usage.strip())
+
+analyze_desc = """\
+Run the full analysis on two lists of SNPs.
+"""
+
+analyze_epilog = """\
+snp_list and comp_list must be files containing newline separated SNP info.
+
+Each line can be one of the following:
+    - an rsID
+    - a chr:loc style name, must be base-1
+    - a tab delimited line with three columns:
+        rsid, chromosome, location (base-1)
+If the line is a tab-delimited line, no database lookup is done, saving a lot
+of time for large lists. Otherwise a dbSNP lookup is required.
+
+To create a file in this format, run this program in preprocess mode.
+"""
+
+pre_desc = """\
+Convert a list of SNP info into a complete set of information to allow running
+in analyze mode without doing a DB lookup.
+"""
+
+pre_epi = """\
+Input file must be a newline separated file where each line can be one of:
+    - an rsID
+    - a chr:loc style name, must be base-1
+    - a tab delimited line with three columns:
+        rsid, chromosome, location (base-1)
+
+The output file will be three column tab-delimited file of:
+    rsid, chromosome, location (base-1)
+"""
 
 def get_arg_parser():
     """Create an argument parser."""
     parser  = _argparse.ArgumentParser(
-        description=__doc__,
+        description=__doc__, #usage=general_usage,
+        formatter_class=_argparse.RawDescriptionHelpFormatter)
+
+    subparsers = parser.add_subparsers(title='mode', dest='mode')
+
+    # Primary mode
+    analyze = subparsers.add_parser(
+        'analyze', usage=analyze_usage,
+        description=analyze_desc, epilog=analyze_epilog,
         formatter_class=_argparse.RawDescriptionHelpFormatter)
 
     # Positional arguments
-    parser.add_argument(
-        'list1',
-        help="SNP list 1, newline separated list of rsids or chr:loc"
+    analyze.add_argument(
+        'snp_list',
+        help="File containing primary list of SNPs to analyze"
     )
-    parser.add_argument(
-        'list2',
-        help="SNP list 2, newline separated list of rsids or chr:loc"
+    analyze.add_argument(
+        'comp_list',
+        help="File containing list of SNPs to compare to"
     )
-    parser.add_argument(
+    analyze.add_argument(
         'outfile', nargs='?',
         help="File to write output to, default is STDOUT"
     )
 
     # Filtering options
-    filtering = parser.add_argument_group('filter', 'Filtration options')
+    filtering = analyze.add_argument_group('filter', 'Filtration options')
     filtering.add_argument('--r2', default=0.9,
                            help='Minimum r-squared to consider LD (0.9)')
     filtering.add_argument('--distance', default='50kb',
                            help='Max distance to consider LD (50kb)')
 
     # Optional flags
-    parser.add_argument('-p', '--pandas', action="store_true",
-                        help="Write file as a pandas DataFrame instead.")
-    parser.add_argument('--populations',
-                        help="Comma separated list of populations to check " +
-                        "Default: all populations.")
+    analyze.add_argument('-p', '--pandas', action="store_true",
+                         help="Write file as a pandas DataFrame instead.")
+    analyze.add_argument('--populations',
+                         help="Comma separated list of populations to check " +
+                         "Default: all populations.")
+
+    # Dump Lists
+    pre = subparsers.add_parser(
+        'preprocess', usage=pre_usage, description=pre_desc, epilog=pre_epi,
+        formatter_class=_argparse.RawDescriptionHelpFormatter)
+
+    pre.add_argument(
+        'snp_list',
+        help="File containing primary list of SNPs to parse"
+    )
+    pre.add_argument(
+        'outfile', nargs='?',
+        help="File to write output to, default is STDOUT"
+    )
 
     return parser
 
@@ -690,27 +915,41 @@ def main(argv=None):
 
     args = parser.parse_args(argv)
 
+    if not args.mode:
+        parser.print_usage()
+        _sys.stdout.write(general_usage)
+        _sys.stderr.write('Mode required.\n')
+        return 2
+
+    with open_zipped(args.snp_list) as fin:
+        snp_list = fin.read().strip().split('\n')
+
+    if args.mode == 'preprocess':
+        outfile = args.outfile if args.outfile else _sys.stdout
+        save_list(snp_list, outfile)
+        return 0
+
     if not args.outfile and args.pandas:
         _sys.stderr.write('Cannot write pandas DataFrame to STDOUT\n')
         return 1
 
-    with open(args.list1) as fin:
-        list1 = fin.read().strip().split('\n')
-    with open(args.list2) as fin:
-        list2 = fin.read().strip().split('\n')
+    with open_zipped(args.comp_list) as fin:
+        comp_list = fin.read().strip().split('\n')
 
     if args.populations:
         pops = args.populations.split(',')
     else:
         pops = None
 
-    out = comp_snp_lists(list1, list2, pops, r2=float(args.r2),
+    out = comp_snp_lists(snp_list, comp_list, pops, r2=float(args.r2),
                          distance=args.distance, return_dataframe=True)
 
     if args.pandas:
         out.to_pickle(args.outfile)
     else:
         out.to_csv(args.outfile, sep='\t')
+
+    return 0
 
 if __name__ == '__main__' and '__file__' in globals():
     _sys.exit(main())

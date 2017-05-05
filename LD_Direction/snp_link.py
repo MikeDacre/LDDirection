@@ -45,7 +45,6 @@ None
 import re as _re
 import sys as _sys
 from time import sleep as _sleep
-from urllib.request import urlopen as _get
 
 import pandas as _pd
 from numpy import nan as _nan
@@ -89,6 +88,10 @@ class SNP_Pair(object):
         Dictionary of alleles by snp
     lookup : dict
         Dictionary of allele in other SNP given an allele in one SNP.
+    ldpair : bool
+        LDpair analysis run
+    snp_lists : bool
+        snp_lists analysis done
 
     Methods
     -------
@@ -97,9 +100,60 @@ class SNP_Pair(object):
 
     """
 
-    def __init__(self, x):
-        """Parse an input dictionary from LDpair."""
-        self.input_dict = x
+    ldpair      = False
+    snp_lists   = False
+    snp1        = None
+    snp2        = None
+    chrom       = None
+    loc1        = None
+    loc2        = None
+    dprime      = None
+    rsquared    = None
+    chisq       = None
+    p           = None
+    p_str       = None
+    populations = None
+    table       = None
+    alleles     = None
+
+    def __init__(self, ldpair=None, plink=None, populations=None):
+        """Create self from either LDpair or plink output.
+
+        If neither are provided, a blank class is created.
+
+        Parameters
+        ----------
+        ldpair : dict, optional
+            The output from LDpair.calculate_pair()
+        plink : dict, optional
+            The output from compare_snp_lists.filter_by_ld() or
+            compare_snp_lists.comp_snp_lists()
+        populations : list, optional
+            A list of populations checked. Required if initializing with plink.
+        """
+        if ldpair:
+            if not isinstance(ldpair, dict):
+                raise ValueError('LDpair output must be a dictionary')
+            self.init_from_ldpair(ldpair)
+        elif plink:
+            if not populations:
+                raise ValueError('populations required if initializing by ' +
+                                 'snp_list/plink')
+            if not isinstance(plink, dict):
+                raise ValueError('comp_snp_lists output must be a dictionary')
+            self.init_from_snp_lists(plink, populations)
+
+    def init_from_ldpair(self, ldpair):
+        """Set attributes using ldpair output.
+
+        Parameters
+        ----------
+        ldpair : dict, optional
+            The output from LDpair.calculate_pair()
+        """
+        # Easier to work with a shorter variable name
+        x = ldpair
+        self.ldpair_dict = x
 
         self.snp1 = x['snp1']['name']
         self.snp2 = x['snp2']['name']
@@ -177,6 +231,48 @@ class SNP_Pair(object):
             self.p = _nan
         self.p_str = p
 
+        self.ldpair = True
+
+    def init_from_snp_lists(self, snp_lists, populations):
+        """Initialize the class using the output from comp_snps."""
+        if isinstance(populations, str):
+            populations = [populations]
+        self.populations = list(populations)
+        assert isinstance(snp_lists, dict)
+        assert len(snp_lists) == 1
+        self.snp1 = list(snp_lists)[0]
+        self.chrom = snp_lists[self.snp1]['chrom']
+        self.loc1  = snp_lists[self.snp1]['loc']
+        other = snp_lists[self.snp1]['matches']
+        assert isinstance(other, dict)
+        assert len(other) == 1
+        self.snp2 = list(other)[0]
+        self.loc2 = other[self.snp2]['loc']
+        self.dprime = other[self.snp2]['dprime']
+        self.rsquared = other[self.snp2]['r2']
+        self.lookup = other[self.snp2]['lookup']
+        self.alleles = {}
+        for a1, a2 in self.lookup[self.snp1].items():
+            for i in [self.snp1, self.snp2]:
+                if i not in self.alleles:
+                    self.alleles[i] = []
+            self.alleles[self.snp1].append(a1)
+            self.alleles[self.snp2].append(a2)
+        self.p = None
+        self.p_str = ''
+        self.snp_lists = True
+
+    def run_ldpair(self):
+        """Run LDpair on self and reinitialize."""
+        _sys.stderr.write('Running LDpair on self.\n')
+        if not self.snp_lists and not self.ldpair:
+            raise Exception('Cannot run LDpair with no data.')
+        self.init_from_ldpair(
+            _ld.calculate_pair(snp1=(self.snp1, self.chrom, self.loc1),
+                               snp2=(self.snp2, self.chrom, self.loc2),
+                               pops=self.populations)
+        )
+
     def lookup_other(self, snp, allele):
         """Return the linked allele for a given snp.
 
@@ -230,7 +326,9 @@ class SNP_Pair(object):
 
     def __str__(self):
         """Print summary"""
-        return _ld.print_summary(self.input_dict)
+        if not self.ldpair:
+            self.run_ldpair()
+        return _ld.print_summary(self.ldpair_dict)
 
 
 ###############################################################################

@@ -76,6 +76,11 @@ def run(command, raise_on_error=False):
 def get_snp_info(snp):
     """Use dbSNP and 1000genomes tabix to get SNP information.
 
+    Parameters
+    ----------
+    snp : str_or_tuple
+        Can be str(rsID), str(chr:loc), or (rsid, chrom, loc)
+
     Returns
     -------
     snp_chrom : str
@@ -100,7 +105,12 @@ def get_snp_info(snp):
         happen.
     """
     # Find RS numbers in dbSNP
-    if snp.startswith('rs'):
+    if isinstance(snp, (list, tuple)):
+        assert len(snp) == 3
+        snp_chrom = snp[1]
+        snp_loc   = int(snp[2])
+        snp       = snp[0]
+    elif snp.startswith('rs'):
         # Connect to snp database
         db = dbSNP.DB(DB_SNP_LOC, DB_SNP_VER)
         snp_coord = db.lookup_rsids(snp)[0]
@@ -188,7 +198,7 @@ def get_snp_info(snp):
     tabix_header_cmd = "tabix -H {} | grep CHROM".format(vcf_file)
     head = run_cmnd(tabix_header_cmd)[0].strip().split()
 
-    return snp_chrom, snp_loc, geno, allele, head, snp_a1, snp_a2
+    return snp, snp_chrom, snp_loc, geno, allele, head, snp_a1, snp_a2
 
 
 def calculate_pair(snp1, snp2, pops, write_summary=None, return_json=False):
@@ -218,9 +228,9 @@ def calculate_pair(snp1, snp2, pops, write_summary=None, return_json=False):
 
     # Get SNP info
     try:
-        (snp1_chrom, snp1_loc, geno1,
+        (snp1, snp1_chrom, snp1_loc, geno1,
          allele1, head1, snp1_a1, snp1_a2) = get_snp_info(snp1)
-        (snp2_chrom, snp2_loc, geno2,
+        (snp2, snp2_chrom, snp2_loc, geno2,
          allele2, head2, snp2_a1, snp2_a2) = get_snp_info(snp2)
     except SNP_Lookup_Failure as e:
         if return_json:

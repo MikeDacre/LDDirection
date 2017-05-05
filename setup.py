@@ -48,7 +48,13 @@ setup(
 
     keywords='likage-disequilibrium LD variation',
 
-    install_requires=['tqdm', 'dbSNP', 'pandas'],
+    install_requires=['tqdm', 'dbSNP', 'pandas', 'cython'],
     packages=['LD_Direction'],
+    entry_points={
+        'console_scripts': [
+            'ldpair = LD_Direction.LDpair:main',
+            'ldlists = LD_Direction.compare_snp_lists:main',
+        ],
+    },
     ext_modules = cythonize('LD_Direction/distance_filtering.pyx'),
 )
