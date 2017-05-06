@@ -17,6 +17,13 @@ License: MIT License, property of Stanford and NCI, use as you wish
 Created: 2017-21-21 10:04
 Version: 0.1.0a
 
+Modules
+-------
+snp_link : provides functions and classes to do one-to-one LD comparisons on
+either just two SNPs, or a list of SNP pairs
+compare_snp_lists : provides functions to do a one-to-many comparison for
+arbitrarily large lists of SNPs (limited only by memory)
+
 LDLink
 ------
 https://analysistools.nci.nih.gov/LDlink
@@ -33,7 +40,8 @@ possible functional variants. Bioinformatics. 2015 Jul 2. PMID: 26139635.
 """
 __version__ = '0.1.0a'
 
+__all__ = ['snp_link', 'compare_snp_lists']
+
 # Make core functions easily available
 from . import snp_link
-from .snp_link import compare_variants
-from .snp_link import compare_two_variants
+from . import compare_snp_lists
