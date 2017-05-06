@@ -53,6 +53,8 @@ from . import LDpair as _ld
 
 SLEEP_TIME = 1.0
 
+__all__ = ['SNP_Pair', 'compare_two_variants', 'compare_variants']
+
 ###############################################################################
 #                          Class to hold the linkage                          #
 ###############################################################################
