@@ -64,6 +64,11 @@ try:
 except ImportError:
     _pd = None
 
+try:
+    import fyrd as _fyrd
+except ImportError:
+    _fyrd = None
+
 import dbSNP as _dbSNP
 
 from .snp_link import SNP_Pair
@@ -556,7 +561,7 @@ def open_zipped(infile, mode='r'):
 ###############################################################################
 
 
-def filter_by_distance(ref_snps, comp_snps, distance='50kb', cores=None):
+def filter_by_distance(ref_snps, comp_snps, distance='50kb'):
     """Create a dictionary of pairwise combinations from list1 and list2.
 
     For every SNP in ref_snps, checks all SNPs in comp_snps to see which are
@@ -571,8 +576,6 @@ def filter_by_distance(ref_snps, comp_snps, distance='50kb', cores=None):
         A distance away from a SNP in list1 to consider SNPs in list2, can be
         a integer of bases or a string with a suffix kb (kilo-bases) or mb
         (mega-bases)
-    cores : int, optional
-        How many cores to use, default is all
 
     Returns
     -------
@@ -604,6 +607,26 @@ def filter_by_distance(ref_snps, comp_snps, distance='50kb', cores=None):
     return results
 
 
+def _ld_job(snps, plink, chrom, r2, populations, pbar=True):
+    """Private function to run plink, see filter_by_ld()."""
+    if pbar and pb:
+        it = pb(snps, unit='plink_calculations')
+        log = it
+    else:
+        it = snps
+        log = _sys.stderr
+    snp_results = {}
+    for snp, _, comp_list in it:
+        if not comp_list:
+            continue
+        comp_snps = [rsid for rsid, loc in comp_list]
+        snp_results[snp] = plink.one_to_many(
+            snp, comp_snps, chrom, r2, populations, raise_on_error=False,
+            logfile=log
+        )
+    return snp_results
+
+
 def filter_by_ld(pairs, r2=0.6, populations=None, plink='plink'):
     """Use plink to lookup LD and filter lists by the r2.
 
@@ -620,20 +643,42 @@ def filter_by_ld(pairs, r2=0.6, populations=None, plink='plink'):
 
     """
     plink = PLINK(plink=plink)
+    l = 0
+    for v in pairs.values():
+        for i in [i[2] for i in v]:
+            l += len(i)
+    multi = True if l > 200 else False
+    if multi:
+        jobs = {}
+        if _fyrd:
+            print('Running jobs on the cluster with fyrd.')
+        else:
+            pool = _mp.Pool()
+            print('Running jobs in parallel')
+
     results = {}
     for chrom in sorted(pairs, key=_chrom_sort):
         snps = pairs[chrom]
         print('Working on chromosome {}'.format(chrom))
-        results[chrom] = {}
-        it = pb(snps, unit='plink_calculations') if pb else snps.items()
-        for snp, _, comp_list in it:
-            if not comp_list:
-                continue
-            comp_snps = [rsid for rsid, loc in comp_list]
-            results[chrom][snp] = plink.one_to_many(
-                snp, comp_snps, chrom, r2, populations, raise_on_error=False,
-                logfile=it
-            )
+        args = (snps, plink, chrom, r2, populations)
+        if multi:
+            args += (False, )
+            if _fyrd:
+                jobs[chrom] = _fyrd.submit(
+                    _ld_job, args, walltime="01:00:00", mem='8G', cores=4)
+            else:
+                jobs[chrom] = pool.apply_async(
+                    _ld_job, args)
+        else:
+            results[chrom] = _ld_job(*args)
+
+    if multi:
+        print('Getting results from parallel jobs')
+        for chrom, job in jobs.items():
+            results[chrom] = job.get()
+        if not _fyrd:
+            pool.close()
+
     # Add all data back again
     filtered = {}
     for chrom, data in pairs.items():
