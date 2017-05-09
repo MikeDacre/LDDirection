@@ -303,9 +303,12 @@ class PLINK(object):
                 return None
         bad = []
         for s in comp_list:
-            if snp not in bim_snps:
+            if s not in bim_snps:
                 bad.append(s)
                 comp_list.remove(s)
+        if bad:
+            _sys.stderr.write(('{} removed from comparison list as not in ' +
+                               'bim file\n').format(bad))
         del(bim_snps)
         # Build the command
         plink_cmnd = (
@@ -650,7 +653,7 @@ def filter_by_ld(pairs, r2=0.6, populations=None, plink='plink'):
     multi = True if l > 200 else False
     if multi:
         jobs = {}
-        if _fyrd:
+        if _fyrd and _fyrd.queue.MODE != 'local':
             print('Running jobs on the cluster with fyrd.')
         else:
             pool = _mp.Pool()
@@ -663,7 +666,7 @@ def filter_by_ld(pairs, r2=0.6, populations=None, plink='plink'):
         args = (snps, plink, chrom, r2, populations)
         if multi:
             args += (False, )
-            if _fyrd:
+            if _fyrd and _fyrd.queue.MODE != 'local':
                 jobs[chrom] = _fyrd.submit(
                     _ld_job, args, walltime="01:00:00", mem='8G', cores=4)
             else:
@@ -676,7 +679,7 @@ def filter_by_ld(pairs, r2=0.6, populations=None, plink='plink'):
         print('Getting results from parallel jobs')
         for chrom, job in jobs.items():
             results[chrom] = job.get()
-        if not _fyrd:
+        if not _fyrd and _fyrd.queue.MODE != 'local':
             pool.close()
 
     # Add all data back again
