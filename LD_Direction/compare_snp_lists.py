@@ -98,6 +98,14 @@ POPULATIONS = ["ALL", "AFR", "AMR", "EAS", "EUR", "SAS", "ACB", "ASW", "BEB",
 # Set data directories
 DATA_DIR = "/godot/1000genomes/1000GP_Phase3"
 
+__all__ = ['comp_snp_lists', 'list_to_rsid_and_locs', 'filter_by_distance',
+           'filter_by_ld', 'save_list']
+
+
+###############################################################################
+#                              Helper Functions                               #
+###############################################################################
+
 
 class MissingSNPError(Exception):
 
@@ -144,6 +152,30 @@ def run(command, raise_on_error=False):
     return out, err, code
 
 
+def _open_zipped(infile, mode='r'):
+    """Return file handle of file regardless of compressed or not.
+
+    Also returns already opened files unchanged, text mode automatic for
+    compatibility with python2.
+    """
+    # Return already open files
+    if hasattr(infile, 'write'):
+        return infile
+    # Make text mode automatic
+    if len(mode) == 1:
+        mode = mode + 't'
+    if not isinstance(infile, str):
+        raise ValueError("I cannot open a filename that isn't a string.")
+    if infile.endswith('.gz'):
+        return _gzip.open(infile, mode)
+    if infile.endswith('.bz2'):
+        if hasattr(_bz2, 'open'):
+            return _bz2.open(infile, mode)
+        else:
+            return _bz2.BZ2File(infile, mode)
+    return open(infile, mode)
+
+
 def _chrom_sort(x):
     """Return an integer for sorting from a chromosome."""
     if x.startswith('chr'):
@@ -158,6 +190,11 @@ def _chrom_sort(x):
         return int(x)
     else:
         return x
+
+
+###############################################################################
+#                   Run plink jobs without repetative code                    #
+###############################################################################
 
 
 class PLINK(object):
@@ -525,38 +562,15 @@ def save_list(snp_list, outfile=None, pickle=False):
     if outfile:
         _sys.stderr.write('Writing output.\n')
         if pickle:
-            with open_zipped(outfile, 'wb') as fout:
+            with _open_zipped(outfile, 'wb') as fout:
                 _pickle.dump(output, fout)
         else:
-            with open_zipped(outfile, 'w') as fout:
+            with _open_zipped(outfile, 'w') as fout:
                 for row in output:
                     rsid, chrom, loc = row
                     fout.write('{}\t{}\t{}\n'.format(rsid, chrom, loc))
     return output
 
-
-def open_zipped(infile, mode='r'):
-    """Return file handle of file regardless of compressed or not.
-
-    Also returns already opened files unchanged, text mode automatic for
-    compatibility with python2.
-    """
-    # Return already open files
-    if hasattr(infile, 'write'):
-        return infile
-    # Make text mode automatic
-    if len(mode) == 1:
-        mode = mode + 't'
-    if not isinstance(infile, str):
-        raise ValueError("I cannot open a filename that isn't a string.")
-    if infile.endswith('.gz'):
-        return _gzip.open(infile, mode)
-    if infile.endswith('.bz2'):
-        if hasattr(_bz2, 'open'):
-            return _bz2.open(infile, mode)
-        else:
-            return _bz2.BZ2File(infile, mode)
-    return open(infile, mode)
 
 
 ###############################################################################
@@ -608,26 +622,6 @@ def filter_by_distance(ref_snps, comp_snps, distance='50kb'):
         results[chrom] = distance_filter(snps, comp_snps[chrom], dist)
 
     return results
-
-
-def _ld_job(snps, plink, chrom, r2, populations, pbar=True):
-    """Private function to run plink, see filter_by_ld()."""
-    if pbar and pb:
-        it = pb(snps, unit='plink_calculations')
-        log = it
-    else:
-        it = snps
-        log = _sys.stderr
-    snp_results = {}
-    for snp, _, comp_list in it:
-        if not comp_list:
-            continue
-        comp_snps = [rsid for rsid, loc in comp_list]
-        snp_results[snp] = plink.one_to_many(
-            snp, comp_snps, chrom, r2, populations, raise_on_error=False,
-            logfile=log
-        )
-    return snp_results
 
 
 def filter_by_ld(pairs, r2=0.6, populations=None, plink='plink'):
@@ -695,6 +689,26 @@ def filter_by_ld(pairs, r2=0.6, populations=None, plink='plink'):
                             filtered[snp]['matches'][snp2] = results[chrom][snp][snp2]
                             filtered[snp]['matches'][snp2]['loc'] = pos2
     return filtered
+
+
+def _ld_job(snps, plink, chrom, r2, populations, pbar=True):
+    """Private function to run plink, see filter_by_ld()."""
+    if pbar and pb:
+        it = pb(snps, unit='plink_calculations')
+        log = it
+    else:
+        it = snps
+        log = _sys.stderr
+    snp_results = {}
+    for snp, _, comp_list in it:
+        if not comp_list:
+            continue
+        comp_snps = [rsid for rsid, loc in comp_list]
+        snp_results[snp] = plink.one_to_many(
+            snp, comp_snps, chrom, r2, populations, raise_on_error=False,
+            logfile=log
+        )
+    return snp_results
 
 
 ###############################################################################
@@ -969,7 +983,7 @@ def main(argv=None):
         _sys.stderr.write('Mode required.\n')
         return 2
 
-    with open_zipped(args.snp_list) as fin:
+    with _open_zipped(args.snp_list) as fin:
         snp_list = fin.read().strip().split('\n')
 
     if args.mode == 'preprocess':
@@ -981,7 +995,7 @@ def main(argv=None):
         _sys.stderr.write('Cannot write pandas DataFrame to STDOUT\n')
         return 1
 
-    with open_zipped(args.comp_list) as fin:
+    with _open_zipped(args.comp_list) as fin:
         comp_list = fin.read().strip().split('\n')
 
     if args.populations:
