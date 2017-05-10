@@ -51,12 +51,14 @@ TODO
 import os as _os
 import re as _re
 import sys as _sys
+import sqlite3 as _sqlite3
 import pickle as _pickle
 import subprocess as _sub
 import argparse as _argparse
 import multiprocessing as _mp
 import bz2 as _bz2
 import gzip as _gzip
+from time import sleep as _sleep
 from tempfile import mkstemp as _temp
 
 try:
@@ -87,7 +89,9 @@ except ImportError:
 
 from .distance_filtering import distance_filter
 
-DB_PATH = '/godot/dbsnp'
+MIN_BUNDLE = 150  # Minimum number of jobs per node, 150 takes less than a minute.
+
+DB_PATH = '/godot/dbsnp/db/hg19'
 DB_VERS = 150
 
 POPULATIONS = ["ALL", "AFR", "AMR", "EAS", "EUR", "SAS", "ACB", "ASW", "BEB",
@@ -229,12 +233,15 @@ class PLINK(object):
                 individuals[pop].append(ind)
         self.individuals = individuals
 
-    def pop_file(self, populations=None):
+    def pop_file(self, populations=None, outfile=None):
         """Write temp file with a list of individuals in population."""
         populations = populations if populations else self.individuals.keys()
         if isinstance(populations, str):
             populations = [populations]
         populations = list(populations)
+        if outfile and _os.path.isfile(outfile):
+            self.written_files[','.join(populations)] = outfile
+            return outfile
         if ','.join(populations) in self.written_files:
             fl = self.written_files[','.join(populations)]
             if _os.path.isfile(fl):
@@ -255,14 +262,15 @@ class PLINK(object):
 
         pop_ids = sorted(set(pop_ids))
 
-        _, file_location = _temp(prefix='-'.join(populations), dir='/tmp')
-        with open(file_location, 'w') as outfile:
-            outfile.write('\n'.join(
+        if not outfile:
+            _, outfile = _temp(prefix='-'.join(populations), dir='/tmp')
+        with open(outfile, 'w') as fout:
+            fout.write('\n'.join(
                 [' '.join(x) for x in zip(pop_ids, pop_ids)]
             ))
 
-        self.written_files[','.join(populations)] = file_location
-        return file_location
+        self.written_files[','.join(populations)] = outfile
+        return outfile
 
     def bim_snps(self, chrom):
         """Return and cache all SNPs in a bim file."""
@@ -411,6 +419,10 @@ def list_to_rsid_and_locs(list1, raise_on_missing=False):
     Uses a single large dbSNP lookup to create a dictionary and then parses
     the two lists.
 
+    If more than 5000 items in rsid list, creates a temp table and joins it.
+
+    Requires about 25 minutes for 250,000 rsIDs.
+
     Parameters
     ----------
     list1 : list_of_str
@@ -466,15 +478,26 @@ def list_to_rsid_and_locs(list1, raise_on_missing=False):
 
     if list1_rs:
         _sys.stderr.write('Doing rsID DB lookup.\n')
-        db = _dbSNP.DB(DB_PATH, DB_VERS)
+        #print(_arrow.now())
+        if len(list1_rs) > 5000:
+            conn = _sqlite3.connect(DB_PATH + '/dbsnp{}.db'.format(DB_VERS))
+            conn.execute("CREATE TEMP TABLE 'temp' (name)")
+            conn.executemany("INSERT INTO temp (name) VALUES (?)", [(i,) for i in list1_rs])
+            q = conn.execute("SELECT dbSNP.name, dbSNP.chrom, dbSNP.start, dbSNP.end FROM dbSNP INNER JOIN temp ON dbSNP.name=temp.name").fetchall()
+        else:
+            db = _dbSNP.DB(DB_PATH, DB_VERS)
+            q = []
+            for chunk in [list1_rs[i:i + 990] for i in range(0, len(list1_rs), 990)]:
+                q += db.query(
+                    db.Row.name, db.Row.chrom, db.Row.start, db.Row.end
+                ).filter(
+                    db.Row.name.in_(chunk)
+                ).all()
         rs_lookup = {
-            i[0]: (i[0], i[1], i[2]+1) for i in db.query(
-                db.Row.name, db.Row.chrom, db.Row.start, db.Row.end
-            ).filter(
-                db.Row.name.in_(list1_rs)
-            )
+            i[0]: (i[0], i[1], i[2]+1) for i in q
             if not i[3]-i[2] > 1
         }
+        #print(_arrow.now())
 
     if list1_locs:
         _sys.stderr.write('Doing position DB lookup.\n')
@@ -483,7 +506,7 @@ def list_to_rsid_and_locs(list1, raise_on_missing=False):
         for chrom, loc in [i.split(':') for i in list1_locs]:
             if chrom not in query:
                 query[chrom] = []
-            query[chrom].append(int(loc-1))
+            query[chrom].append(int(loc)-1)
         loc_lookup = {
             '{}:{}'.format(i.chrom, i.start+1): (i.name, i.chrom, i.start+1)
             for i in db.lookup_locations(query)
@@ -491,7 +514,7 @@ def list_to_rsid_and_locs(list1, raise_on_missing=False):
         }
 
     failed  = []
-    results = {}
+    results = []
     done = []
     for snp in list1:
         if isinstance(snp, str) and '\t' in snp:
@@ -511,18 +534,26 @@ def list_to_rsid_and_locs(list1, raise_on_missing=False):
                 failed.append(snp)
                 continue
             s_rs, s_chrom, s_loc = loc_lookup[snp]
-        if s_chrom not in results:
-            results[s_chrom] = []
         if s_rs in done:
             continue
         done.append(s_rs)
-        results[s_chrom].append((s_rs, s_loc))
+        results.append((s_rs, s_chrom, s_loc))
     if failed:
         err = '{} not in dbSNP'.format(snp)
         if raise_on_missing:
             raise MissingSNPError(err)
         else:
             _sys.stderr.write(err + '\n')
+    return results
+
+
+def snp_list_to_dict(list1):
+    """Convert a list from list_to_rsid_and_locs() to a chrom dict."""
+    results = {}
+    for s_rs, s_chrom, s_loc in list1:
+        if s_chrom not in results:
+            results[s_chrom] = []
+        results[s_chrom].append((s_rs, int(s_loc)))
     return results
 
 
@@ -555,21 +586,17 @@ def save_list(snp_list, outfile=None, pickle=False):
     _sys.stderr.write('Parsing input list.\n')
     parsed_list = list_to_rsid_and_locs(snp_list)
     _sys.stderr.write('Done.\n')
-    output = []
-    for chrom, info in parsed_list.items():
-        for rsid, loc in info:
-            output.append((rsid, chrom, loc))
     if outfile:
         _sys.stderr.write('Writing output.\n')
         if pickle:
             with _open_zipped(outfile, 'wb') as fout:
-                _pickle.dump(output, fout)
+                _pickle.dump(parsed_list, fout)
         else:
             with _open_zipped(outfile, 'w') as fout:
-                for row in output:
+                for row in parsed_list:
                     rsid, chrom, loc = row
                     fout.write('{}\t{}\t{}\n'.format(rsid, chrom, loc))
-    return output
+    return parsed_list
 
 
 
@@ -606,25 +633,29 @@ def filter_by_distance(ref_snps, comp_snps, distance='50kb'):
     """
     # Calculate distance
     if isinstance(distance, str):
-        dist, mod = _re.match(r'(\d+)(\D+)', '50kb').groups()
+        dist, mod = _re.match(r'(\d+)(\D+)', distance).groups()
         dist = int(dist)
         mod = mod.lower()
-        if not mod in ['kb', 'mb']:
-            raise ValueError('Cannot parse {}, must be in kb or mb only'
-                             .format(distance))
-        if mod == 'kb':
-            dist = dist * 1000
-        elif mod == 'mb':
-            dist = dist * 1000000
+        if mod:
+            if not mod in ['kb', 'mb']:
+                raise ValueError('Cannot parse {}, must be in kb or mb only'
+                                .format(distance))
+            if mod == 'kb':
+                dist = dist * 1000
+            elif mod == 'mb':
+                dist = dist * 1000000
 
     results = {}
     for chrom, snps in ref_snps.items():
+        if chrom not in comp_snps:
+            continue
         results[chrom] = distance_filter(snps, comp_snps[chrom], dist)
 
     return results
 
 
-def filter_by_ld(pairs, r2=0.6, populations=None, plink='plink'):
+def filter_by_ld(pairs, r2=0.6, populations=None, plink='plink',
+                 cluster_jobs=100, force_local=False, **cluster_opts):
     """Use plink to lookup LD and filter lists by the r2.
 
     Parameters
@@ -637,43 +668,101 @@ def filter_by_ld(pairs, r2=0.6, populations=None, plink='plink'):
         (mega-bases)
     plink : str, optional
         Path to plink executable, otherwise searches PATH
+    cluster_jobs : int, optional
+        Number of jobs to run on the cluster if cluster running is enabled, if
+        fyrd is not enabled, this ends up being the number of local cores (in
+        that case, the max is the result of multiprocessing.cpu_count()).
+    force_local : bool, optional
+        If True, disallow running jobs on the cluster with fyrd
+    cluster_opts : dict, optional
+        Optional keyword arguments to pass to fyrd
 
     """
     plink = PLINK(plink=plink)
+    plink.pop_file(populations, outfile=','.join(populations) + '.pops.txt')
     l = 0
     for v in pairs.values():
-        for i in [i[2] for i in v]:
+        for i in [i[2] for i in v if i[2]]:
             l += len(i)
-    multi = True if l > 200 else False
-    if multi:
-        jobs = {}
-        if _fyrd and _fyrd.queue.MODE != 'local':
+    multi = True if l > 200 else False  # 200 jobs take 50 seconds
+    if multi and cluster_jobs > 1:
+        # Set up cluster running
+        if _fyrd and _fyrd.queue.MODE != 'local' and not force_local:
             print('Running jobs on the cluster with fyrd.')
+            fyrd = True
         else:
-            pool = _mp.Pool()
-            print('Running jobs in parallel')
+            print('Running jobs in parallel locally')
+            cores = max(cluster_jobs, _mp.cpu_count())
+            pool = _mp.Pool(cores)
+            fyrd = False
+        # Bundle jobs
+        bundle_count = int(l/cluster_jobs)
+        bundle_count = max(bundle_count, MIN_BUNDLE)
+        count = bundle_count
+        # Get walltime based on 6s per job + 40 minutes
+        # Average on a standard machine is 2 seconds, so this is
+        # an overestimate
+        time = _to_time((bundle_count*6))
+        _sys.stderr.write('Estimated max time per job {} '.format(time) +
+                          '(walltime req will add 40 min to this)\n')
 
-    results = {}
+    jobs = [[]]
+    n = 0
+    skipped = 0
     for chrom in sorted(pairs, key=_chrom_sort):
         snps = pairs[chrom]
-        print('Working on chromosome {}'.format(chrom))
-        args = (snps, plink, chrom, r2, populations)
+        args = (chrom, r2, populations, False)
+        # Bundle jobs
+        if not multi:
+            # Bundle by chromosome if not multithreading
+            bundle_count = len(snps)
+            count = bundle_count
+        for snp, _, comp_list in snps:
+            if not comp_list:
+                skipped += 1
+                continue
+            comp_snps = [rsid for rsid, loc in comp_list]
+            if not count:
+                count = bundle_count
+                jobs.append([])
+                n += 1
+            jobs[n].append((snp, comp_snps) + args)
+            count -= 1
+
+    if skipped:
+        _sys.stderr.write('{} jobs had no comparison list and were skipped\n'
+                          .format(skipped))
+    # Submit jobs
+    running = []
+    results = {}
+    for jobset in jobs:
         if multi:
-            args += (False, )
-            if _fyrd and _fyrd.queue.MODE != 'local':
-                jobs[chrom] = _fyrd.submit(
-                    _ld_job, args, walltime="01:00:00", mem='8G', cores=4)
+            if fyrd:
+                time = _to_time((len(jobset)*6)+2400)
+                running.append(
+                    _fyrd.submit(
+                        _ld_job, (jobset, plink),
+                        walltime=time, mem='8G', cores=4, **cluster_opts)
+                )
             else:
-                jobs[chrom] = pool.apply_async(
-                    _ld_job, args)
+                running.append(pool.apply_async(_ld_job, jobset))
         else:
-            results[chrom] = _ld_job(*args)
+            # Just run jobs per chromosome
+            results.update(_ld_job(jobset, plink))
 
     if multi:
         print('Getting results from parallel jobs')
-        for chrom, job in jobs.items():
-            results[chrom] = job.get()
-        if not _fyrd and _fyrd.queue.MODE != 'local':
+        if fyrd:
+            todo = len(running)
+            while todo:
+                for job in running:
+                    if job.done:
+                        results.update(job.get())
+                        todo -= 1
+                _sleep(2)
+        else:
+            for job in running:
+                results.update(job.get())
             pool.close()
 
     # Add all data back again
@@ -681,34 +770,38 @@ def filter_by_ld(pairs, r2=0.6, populations=None, plink='plink'):
     for chrom, data in pairs.items():
         for snp, loc, comp_list in data:
             filtered[snp] = {'loc': loc, 'chrom': chrom}
-            if snp in results[chrom]:
-                if results[chrom][snp]:
+            if snp in results:
+                if results[snp]:
                     filtered[snp]['matches'] = {}
                     for snp2, pos2 in comp_list:
-                        if snp2 in results[chrom][snp]:
-                            filtered[snp]['matches'][snp2] = results[chrom][snp][snp2]
+                        if snp2 in results[snp]:
+                            filtered[snp]['matches'][snp2] = results[snp][snp2]
                             filtered[snp]['matches'][snp2]['loc'] = pos2
     return filtered
 
 
-def _ld_job(snps, plink, chrom, r2, populations, pbar=True):
-    """Private function to run plink, see filter_by_ld()."""
-    if pbar and pb:
-        it = pb(snps, unit='plink_calculations')
-        log = it
-    else:
-        it = snps
-        log = _sys.stderr
+def _ld_job(jobs, plink):
+    """Private function to run plink, see filter_by_ld().
+
+    Parameters
+    ----------
+    jobs : list_of_tuple
+        A list of job arguments:
+            (snp, comp_snps, chrom, r2, populations, raise_on_error, logfile)
+    plink : PLINK
+        An initialized plink class
+    """
     snp_results = {}
-    for snp, _, comp_list in it:
-        if not comp_list:
-            continue
-        comp_snps = [rsid for rsid, loc in comp_list]
-        snp_results[snp] = plink.one_to_many(
-            snp, comp_snps, chrom, r2, populations, raise_on_error=False,
-            logfile=log
-        )
+    for job in jobs:
+        snp_results[job[0]] = plink.one_to_many(*job)
     return snp_results
+
+
+def _to_time(s):
+    """Convert seconds to 00:00:00 format."""
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    return '{}:{:02}:{:02}'.format(h, m, s)
 
 
 ###############################################################################
@@ -773,7 +866,8 @@ def pairs_to_SNP_Pairs(pairs, populations):
 
 
 def comp_snp_lists(list1, list2, populations=None, r2=0.6, distance='50kb',
-                   plink='plink', return_dataframe=False, return_snppair=False,
+                   plink='plink', lists_preparsed=False,
+                   return_dataframe=False, return_snp_pairs=False,
                    raise_on_error=False):
     """Compare two SNP lists, filter by r2.
 
@@ -803,9 +897,12 @@ def comp_snp_lists(list1, list2, populations=None, r2=0.6, distance='50kb',
         (mega-bases)
     plink : str, optional
         Path to plink executable, otherwise searches PATH
+    lists_preparsed : bool, optional
+        If the input lists are already in three-tuples will all data acounted
+        for, skip the dbSNP phase.
     return_dataframe : bool, optional
         Return a dataframe instead of JSON
-    return_snppair : bool, optional
+    return_snp_pairs : bool, optional
         Return a dictionary of SNP_Link objects
     raise_on_error : bool, optional
         Raise an Exception if there is a problem with any of the SNPs in the
@@ -814,7 +911,7 @@ def comp_snp_lists(list1, list2, populations=None, r2=0.6, distance='50kb',
     Returns
     -------
     JSON : dict
-        If return_dataframe and return_snppairs are False, a json-style
+        If return_dataframe and return_snp_pairss are False, a json-style
         dictionary is returned with the format:
             {snp1: {chrom: chrX, loc: #, matches:
                 {snp2: {loc: #, r2: float, dprime: float, phased: AT/GC,
@@ -830,10 +927,15 @@ def comp_snp_lists(list1, list2, populations=None, r2=0.6, distance='50kb',
         If return_snplink is True, a dictionary of SNP_Link objects is returned
             {snp1: [SNP_Pair, SNP_Pair, ...]}
     """
-    print('Getting SNP info for list1')
-    snps1 = list_to_rsid_and_locs(list1, raise_on_error)
-    print('Getting SNP info for list2')
-    snps2 = list_to_rsid_and_locs(list2, raise_on_error)
+    if not lists_preparsed:
+        print('Getting SNP info for list1')
+        list1 = list_to_rsid_and_locs(list1, raise_on_error)
+        print('Getting SNP info for list2')
+        list2 = list_to_rsid_and_locs(list2, raise_on_error)
+
+    snps1 = snp_list_to_dict(list1)
+    snps2 = snp_list_to_dict(list2)
+
     print('Getting all possible pairs within {}'.format(distance))
     pairs = filter_by_distance(snps1, snps2, distance=distance)
     l = 0
@@ -845,7 +947,7 @@ def comp_snp_lists(list1, list2, populations=None, r2=0.6, distance='50kb',
     print('Done')
     if return_dataframe:
         return pairs_to_dataframe(pairs)
-    if return_snppair:
+    if return_snp_pairs:
         return pairs_to_SNP_Pairs(pairs, populations=populations)
     return pairs
 
