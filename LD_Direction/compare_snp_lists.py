@@ -107,121 +107,40 @@ __all__ = ['comp_snp_lists', 'list_to_rsid_and_locs', 'filter_by_distance',
 
 
 ###############################################################################
-#                              Helper Functions                               #
-###############################################################################
-
-
-class MissingSNPError(Exception):
-
-    """Exceception to catch missing SNPs."""
-
-    pass
-
-
-class BadSNPError(Exception):
-
-    """Exceception to catch missing SNPs."""
-
-    pass
-
-
-def run(command, raise_on_error=False):
-    """Run a command with subprocess the way it should be.
-
-    Parameters
-    ----------
-    command : str
-        A command to execute, piping is fine.
-    raise_on_error : bool
-        Raise a subprocess.CalledProcessError on exit_code != 0
-
-    Returns
-    -------
-    stdout : str
-    stderr : str
-    exit_code : int
-    """
-    pp = _sub.Popen(command, shell=True, universal_newlines=True,
-                    stdout=_sub.PIPE, stderr=_sub.PIPE)
-    out, err = pp.communicate()
-    code = pp.returncode
-    if raise_on_error and code != 0:
-        _sys.stderr.write(
-            '{}\nfailed with:\nCODE: {}\nSTDOUT:\n{}\nSTDERR:\n{}\n'
-            .format(command, code, out, err)
-        )
-        raise _sub.CalledProcessError(
-            returncode=code, cmd=command, output=out, stderr=err
-        )
-    return out, err, code
-
-
-def _open_zipped(infile, mode='r'):
-    """Return file handle of file regardless of compressed or not.
-
-    Also returns already opened files unchanged, text mode automatic for
-    compatibility with python2.
-    """
-    # Return already open files
-    if hasattr(infile, 'write'):
-        return infile
-    # Make text mode automatic
-    if len(mode) == 1:
-        mode = mode + 't'
-    if not isinstance(infile, str):
-        raise ValueError("I cannot open a filename that isn't a string.")
-    if infile.endswith('.gz'):
-        return _gzip.open(infile, mode)
-    if infile.endswith('.bz2'):
-        if hasattr(_bz2, 'open'):
-            return _bz2.open(infile, mode)
-        else:
-            return _bz2.BZ2File(infile, mode)
-    return open(infile, mode)
-
-
-def _chrom_sort(x):
-    """Return an integer for sorting from a chromosome."""
-    if x.startswith('chr'):
-        x = x[3:]
-    if x.upper() == 'X':
-        return 100
-    elif x.upper() == 'Y':
-        return 101
-    elif x.upper().startswith('M'):
-        return 150
-    elif x.isdigit():
-        return int(x)
-    else:
-        return x
-
-
-###############################################################################
 #                   Run plink jobs without repetative code                    #
 ###############################################################################
 
 
 class PLINK(object):
 
-    """A reusable object to run plink jobs quickly."""
+    """A reusable object to run plink jobs on 1000genomes files quickly."""
 
     written_files = {}
     bims = {}
 
-    def __init__(self, pop_file=None, plink='plink'):
+    def __init__(self, data=None, pop_file=None, plink='plink'):
         """Load population information.
 
         Parameters
         ----------
+        data : str, optional
+            Path the the 1000genomes data files
+            (e.g. ALL.chr16.phase3_shapeit2_mvncall_integrated_v5a.20130502.genotypes.{bed,bim})
+            Default set in DATA_DIR hardcoded in this file.
         pop_file : str, optional
             Path to the 1000 genomes population file
         plink : str, optional
             Path to plink executable, otherwise searches PATH
         """
         self.plink = plink
+        data = data if data else DATA_DIR
+        if not _os.path.isdir(data):
+            raise ValueError('{} must be a directory, but no directory found'
+                             .format(data))
+        self.path = _os.path.abspath(data)
         if not pop_file:
             pop_file = _os.path.join(
-                DATA_DIR, 'integrated_call_samples_v3.20130502.ALL.panel'
+                self.path, 'integrated_call_samples_v3.20130502.ALL.panel'
             )
         individuals = {}
         with open(pop_file) as fin:
@@ -232,6 +151,35 @@ class PLINK(object):
                     individuals[pop] = []
                 individuals[pop].append(ind)
         self.individuals = individuals
+        self.files = {}
+        for fl in _os.listdir(self.path):
+            if 'phase3_' not in fl:
+                continue
+            if not fl.endswith('bed'):
+                continue
+            if not fl.startswith('ALL'):
+                continue
+            chrom = fl.split('.')[1]
+            if not chrom.startswith('chr'):
+                continue
+            fl    = _os.path.abspath(_os.path.join(self.path, fl))
+            root  = '.'.join(fl.split('.')[:-1])
+            bed   = _os.path.abspath('{}.bed'.format(root))
+            bim   = _os.path.abspath('{}.bim'.format(root))
+            fam   = _os.path.abspath('{}.fam'.format(root))
+            assert _os.path.isfile(bed)
+            assert _os.path.isfile(bim)
+            assert _os.path.isfile(fam)
+            c1 = chrom if chrom.startswith('chr') else 'chr' + str(chrom)
+            c2 = c1[3:]
+            for c in [c1, c2]:
+                self.files[c] = {
+                    'root': root,
+                    'bed': bed,
+                    'bim': bim,
+                    'fam': fam,
+                }
+        print(self.files.keys())
 
     def pop_file(self, populations=None, outfile=None):
         """Write temp file with a list of individuals in population."""
@@ -272,27 +220,223 @@ class PLINK(object):
         self.written_files[','.join(populations)] = outfile
         return outfile
 
-    def bim_snps(self, chrom):
-        """Return and cache all SNPs in a bim file."""
-        if chrom in self.bims:
-            with open(self.bims[chrom], 'rb') as fin:
-                return _pickle.load(fin)
-        bfile = _os.path.join(
-            DATA_DIR,
-            'ALL.{}.phase3_shapeit2_mvncall_integrated_v5a.20130502.genotypes'
-            .format(chrom)
-        )
-        bim = bfile + '.bim'
+    def bim_file(self, chrom, snps, outfile=None):
+        """Filter a bim file to only include SNPs in snps.
+
+        Parameters
+        ----------
+        chrom : str
+            A chromosome name for the file to work on.
+        snps : list_of_tuple
+            A list of snps from list_to_rsid_and_locs():
+                (rsid, chrom, loc)
+        outfile : str, optional
+            A file to write to. A tempfile will be created if not is provided.
+
+        Returns
+        -------
+        file_path : str
+            Absolute path to the newly created file.
+        """
+        if not chrom in self.files:
+            raise ValueError(
+                '{} is not in our bim files:\n{}'.format(
+                    chrom,
+                    '\n'.join([i[' bim'] for i in self.files.values()])
+                )
+            )
+        snps = [(str(name), int(loc)) for name, loc in snps]
+        if not outfile:
+            _, outfile = _temp(
+                prefix='filtered_bim.', suffix='.bim', dir='/tmp'
+            )
+        outfile = _os.path.abspath(outfile)
+        with _open_zipped(outfile, 'w') as fout:
+            for c, name, cm, pos, a1, a2 in read_bim(self.files[chrom]['bim']):
+                if (name, pos) in snps:
+                    fout.write('\t'.join([c, name, cm, str(pos), a1, a2]) + '\n')
+        return outfile
+
+    def bim_snps(self, chrom, bim_file=None):
+        """Return and cache all SNPs in a bim file.
+
+        Note: will only cache rsids in bim if no bim_file is given.
+
+        Parameters
+        ----------
+        chrom : str
+        bim_file : str, optional
+            Bim file to work on, otherwise the chromosome is used to pick the
+            complete file.
+
+        Returns
+        -------
+        rsids : frozenset
+        """
+        if not bim_file:
+            if chrom in self.bims:
+                with open(self.bims[chrom], 'rb') as fin:
+                    return _pickle.load(fin)
+            try:
+                bim_file = self.files[chrom]['bim']
+            except KeyError:
+                raise KeyError('{} is not in the bim file list'.format(chrom))
+            _, pfl = _temp()
+        else:
+            pfl = None
         rsids = []
-        with open(bim) as fin:
+        with open(bim_file) as fin:
             for line in fin:
-                rsids.append(line.split('\t')[1])
+                if not line.strip():
+                    continue
+                rsids.append(line.strip().split('\t')[1])
         rsids = frozenset(rsids)
-        _, pfl = _temp()
-        with open(pfl, 'wb') as fout:
-            _pickle.dump(rsids, fout)
-        self.bims[chrom] = pfl
+        if pfl:
+            with open(pfl, 'wb') as fout:
+                _pickle.dump(rsids, fout)
+            self.bims[chrom] = pfl
         return rsids
+
+    def many_to_many(self, snps, comp_list, chrom, r2=0.6, populations=None,
+                     fbim_file=None, outfile=None, raise_on_error=False,
+                     logfile=_sys.stderr):
+        """Get many-to-many LD information using plink.
+
+        Will do a single lookup for all SNPs in snps using plink on a filtered
+        bim file generated to only contain the SNPs in comp_list.
+
+        Parameters
+        ----------
+        snps : list_of_tuple
+            list of rsIDs to query in the format:
+                (rsid, loc) (from pairs_to_lists())
+        comp_list : list_of_tuple
+            list of rsIDs to compare to in the format:
+                (rsid, loc) (from pairs_to_lists())
+        chrom : str
+            which chromosome to search
+        r2 : float, optional
+            r-squared level to use for filtering
+        populations : list_of_str, optional
+            list of populations to include in the analysis
+        fbim_file : str, optional
+            File to write the filtered bims to, if not provided a temp file
+            will be used and deleted.
+        outfile : str, optional
+            A file root for plink to write to, output will have '.ld' appended
+            to it. If not provided, temp file used and deleted after use.
+        raise_on_error : bool, optional
+            if False, will return None if primary SNP missing from bim file
+        logfile : filehandle, optional
+            A file like object to write to
+
+        Returns
+        -------
+        matching_snps : dict
+            For every matching SNP that beats the r-squared: {
+                snp: {r2: r-squared, dprime: d-prime, phased: phased-alleles}
+            }
+            If plink job fails, returns an empty dictionary.
+        """
+        if not snps or not comp_list:
+            raise ValueError('snps and comp_list cannot be null')
+        snps = set(snps)
+        comp_list = set(comp_list)
+        all_snps = snps | comp_list
+        bfile = self.bim_file(chrom, all_snps, fbim_file)
+        bsnps = self.bim_snps(chrom, bfile)
+        good  = []
+        bad   = []
+        rsids = {}
+        for rsid, loc in snps:
+            if rsid in bsnps:
+                good.append(rsid)
+                rsids[rsid] = int(loc)
+            else:
+                bad.append(rsid)
+        if bad:
+            _sys.stderr.write(
+                'The following SNPs are not in the bim file and cannot be ' +
+                'queried:\n{}\n'.format(bad)
+            )
+        del(bsnps)
+        # Initialize necessary files
+        bed = self.files[chrom]['bed']
+        fam = self.files[chrom]['fam']
+        pop_file = self.pop_file(populations)
+        if outfile:
+            del_file = False
+        else:
+            _, outfile = _temp(prefix='plink', dir='/tmp')
+            del_file = True
+        _, snp_file = _temp(prefix='plinksnps', dir='/tmp')
+        with open(snp_file, 'w') as fout:
+            fout.write('\n'.join(sorted([snp for snp, _ in comp_list])))
+
+        # Build the command
+        plink_cmnd = (
+            '{plink} --bed {bed} --bim {bim} --fam {fam} --r2 in-phase dprime '
+            '--ld-snp-list {snp_file} --keep {ind_file} --out {out}'
+        ).format(
+            plink=self.plink,
+            bed=bed, bim=bfile, fam=fam, snp_file=snp_file,
+            ind_file=pop_file, out=outfile
+        )
+        print(plink_cmnd)
+
+        # Run it
+        stdout, stderr, code = run(plink_cmnd, raise_on_error)
+        # Parse the output file
+        if code != 0:
+            logfile.write(
+                '{}: plink command failed'.format(chrom) +
+                'Command: {}\nExit Code: {}\nSTDOUT:\n{}\bSTDERR:\n{}\n'
+                .format(plink_cmnd, code, stdout, stderr)
+            )
+            return {}
+
+        results = {}
+        with open(outfile + '.ld') as fin:
+            # Check header
+            line = fin.readline().strip()
+            assert _re.split(r' +', line) == [
+                'CHR_A', 'BP_A', 'SNP_A', 'CHR_B', 'BP_B',
+                'SNP_B', 'PHASE', 'R2', 'DP'
+            ]
+            for line in fin:
+                f = _re.split(r' +', line.strip())
+                snp1, snp2, phased = f[2], f[5], f[6]
+                loc1, loc2 = int(f[1]), int(f[4])
+                rsquared, dprime = float(f[7]), float(f[8])
+                if snp1 not in good:
+                    continue
+                if loc1 != rsids[snp1]:
+                    continue
+                if snp1 not in results:
+                    results[snp1] = {
+                        'chrom': chrom, 'loc': loc1, 'matches': {}
+                    }
+                if rsquared < r2:
+                    continue
+                try:
+                    p1, p2 = phased.split('/')
+                    s1a, s2a = p1
+                    s1b, s2b = p2
+                    lookup = {snp1:  {s1a: s2a, s1b: s2b},
+                              snp2: {s2a: s1a, s2b: s1b}}
+                except ValueError:
+                    lookup = {}
+                results[snp1]['matches'][snp2] = {
+                    'r2': rsquared, 'dprime': dprime, 'loc': loc2,
+                    'phased': phased, 'lookup': lookup
+                }
+
+        if del_file:
+            _os.remove(outfile + '.ld')
+
+        return results
+
+
 
     def one_to_many(self, snp, comp_list, chrom, r2=0.6, populations=None,
                     raise_on_error=False, logfile=_sys.stderr):
@@ -403,6 +547,7 @@ class PLINK(object):
                                  'phased': phased, 'lookup': lookup}
         _os.remove(temp_file + '.ld')
         return results
+
 
 
 ###############################################################################
@@ -639,7 +784,7 @@ def filter_by_distance(ref_snps, comp_snps, distance='50kb'):
         if mod:
             if not mod in ['kb', 'mb']:
                 raise ValueError('Cannot parse {}, must be in kb or mb only'
-                                .format(distance))
+                                 .format(distance))
             if mod == 'kb':
                 dist = dist * 1000
             elif mod == 'mb':
@@ -655,8 +800,72 @@ def filter_by_distance(ref_snps, comp_snps, distance='50kb'):
 
 
 def filter_by_ld(pairs, r2=0.6, populations=None, plink='plink',
-                 cluster_jobs=100, force_local=False, **cluster_opts):
+                 data_dir=None):
     """Use plink to lookup LD and filter lists by the r2.
+
+    One job per chromosome.
+
+    Parameters
+    ----------
+    pairs : dict
+        The output of filter_by_distance()
+    r2 : float
+        An r-squared cutoff to use for filtering
+    distance : str_or_int
+        A distance away from a SNP in list1 to consider SNPs in list2, can be
+        a integer of bases or a string with a suffix kb (kilo-bases) or mb
+        (mega-bases)
+    plink : str, optional
+        Path to plink executable, otherwise searches PATH
+    data_dir : str, optional
+        Path to directory containing 1000genomes data, default set in DATA_DIR
+        hardcoded into this file.
+
+    Returns
+    -------
+    pairs : dict
+        snp: {chrom: chrom, loc: loc, matches: {
+            snp2: {rsquared: r2, dprime: d', loc: loc2}
+    """
+    plink = PLINK(data=data_dir, plink=plink)
+    # Initialize the population file
+    plink.pop_file(populations, outfile='.'.join(populations) + '.pops.txt')
+    l = 0
+    for v in pairs.values():
+        for i in [i[2] for i in v if i[2]]:
+            l += len(i)
+    multi = True if l > 200 else False
+
+    # Run plink jobs
+    results = {}
+    for chrom in sorted(pairs, key=_chrom_sort):
+        data = pairs[chrom]
+        snps, comp_list = pairs_to_lists(data)
+        results.update(
+            plink.many_to_many(
+                snps, comp_list, chrom, r2=r2, populations=populations
+            )
+        )
+
+    # Add all data back again
+    filtered = {}
+    for chrom, data in pairs.items():
+        for snp, loc, comp_list in data:
+            filtered[snp] = {'loc': loc, 'chrom': chrom}
+            if snp in results:
+                if results[snp]:
+                    filtered[snp]['matches'] = {}
+                    for snp2, pos2 in comp_list:
+                        if snp2 in results[snp]:
+                            filtered[snp]['matches'][snp2] = results[snp][snp2]
+                            filtered[snp]['matches'][snp2]['loc'] = pos2
+    return filtered
+
+
+def filter_by_ld_one_by_one(pairs, r2=0.6, populations=None, plink='plink',
+                            cluster_jobs=100, force_local=False,
+                            **cluster_opts):
+    """Use plink to lookup LD and filter lists by the r2 with one job per snp.
 
     Parameters
     ----------
@@ -867,6 +1076,7 @@ def pairs_to_SNP_Pairs(pairs, populations):
 
 def comp_snp_lists(list1, list2, populations=None, r2=0.6, distance='50kb',
                    plink='plink', lists_preparsed=False,
+                   dbsnp_loc=None, dbsnp_ver=None, data_dir=None,
                    return_dataframe=False, return_snp_pairs=False,
                    raise_on_error=False):
     """Compare two SNP lists, filter by r2.
@@ -900,6 +1110,12 @@ def comp_snp_lists(list1, list2, populations=None, r2=0.6, distance='50kb',
     lists_preparsed : bool, optional
         If the input lists are already in three-tuples will all data acounted
         for, skip the dbSNP phase.
+    dbsnp_loc : str, optional
+        Path to dbSNP sqlite database files
+    dbsnp_ver : int : optional
+        Version of dbSNP to use
+    data_dir : str, optional
+        Path to 1000genomes files
     return_dataframe : bool, optional
         Return a dataframe instead of JSON
     return_snp_pairs : bool, optional
@@ -943,13 +1159,156 @@ def comp_snp_lists(list1, list2, populations=None, r2=0.6, distance='50kb',
         for i in [i[2] for i in v]:
             l += len(i)
     print('Running plink filters on {} calculations'.format(l))
-    pairs = filter_by_ld(pairs, r2, populations=populations, plink=plink)
+    pairs = filter_by_ld(pairs, r2, populations=populations, plink=plink,
+                         data_dir=data_dir)
     print('Done')
     if return_dataframe:
         return pairs_to_dataframe(pairs)
     if return_snp_pairs:
         return pairs_to_SNP_Pairs(pairs, populations=populations)
     return pairs
+
+
+###############################################################################
+#                              Helper Functions                               #
+###############################################################################
+
+
+class MissingSNPError(Exception):
+
+    """Exceception to catch missing SNPs."""
+
+    pass
+
+
+class BadSNPError(Exception):
+
+    """Exceception to catch missing SNPs."""
+
+    pass
+
+
+def pairs_to_lists(pairs):
+    """Convert list of pairs into to two tuple lists.
+
+    Removes any SNPs with an empty match list.
+
+    Parameters
+    ----------
+    pairs : list
+        From filter_by_distance():
+            (rsid, loc, set((rsid, loc)))
+
+    Returns
+    -------
+    snp_list : list_of_tuple
+    comp_list : list_of_tuple
+        (rsid, loc)
+    """
+    query = []
+    comp  = []
+    for snp, loc, matches in pairs:
+        if not matches:
+            continue
+        query.append((snp, loc))
+        for snp2, loc2 in matches:
+            comp.append((snp2, loc2))
+    return set(query), set(comp)
+
+
+def run(command, raise_on_error=False):
+    """Run a command with subprocess the way it should be.
+
+    Parameters
+    ----------
+    command : str
+        A command to execute, piping is fine.
+    raise_on_error : bool
+        Raise a subprocess.CalledProcessError on exit_code != 0
+
+    Returns
+    -------
+    stdout : str
+    stderr : str
+    exit_code : int
+    """
+    pp = _sub.Popen(command, shell=True, universal_newlines=True,
+                    stdout=_sub.PIPE, stderr=_sub.PIPE)
+    out, err = pp.communicate()
+    code = pp.returncode
+    if raise_on_error and code != 0:
+        _sys.stderr.write(
+            '{}\nfailed with:\nCODE: {}\nSTDOUT:\n{}\nSTDERR:\n{}\n'
+            .format(command, code, out, err)
+        )
+        raise _sub.CalledProcessError(
+            returncode=code, cmd=command, output=out, stderr=err
+        )
+    return out, err, code
+
+
+def read_bim(bim_file):
+    """Yields a tuple for each line in bim_file.
+
+    Parameters
+    ----------
+    bim_file : str
+        Path to a bim file, can be zipped or an open file handle.
+
+    Yields
+    ------
+    chromsome : str
+    name : str
+    cm : str
+        Position in centimorgans, usually 0
+    position : int
+    allele_1 : str
+    allele_2 : str
+    """
+    with _open_zipped(bim_file) as fin:
+        for line in fin:
+            chrom, name, cm, loc, a1, a2 = line.split('\t')
+            yield chrom, name, cm, int(loc), a1, a2
+
+
+def _open_zipped(infile, mode='r'):
+    """Return file handle of file regardless of compressed or not.
+
+    Also returns already opened files unchanged, text mode automatic for
+    compatibility with python2.
+    """
+    # Return already open files
+    if hasattr(infile, 'write'):
+        return infile
+    # Make text mode automatic
+    if len(mode) == 1:
+        mode = mode + 't'
+    if not isinstance(infile, str):
+        raise ValueError("I cannot open a filename that isn't a string.")
+    if infile.endswith('.gz'):
+        return _gzip.open(infile, mode)
+    if infile.endswith('.bz2'):
+        if hasattr(_bz2, 'open'):
+            return _bz2.open(infile, mode)
+        else:
+            return _bz2.BZ2File(infile, mode)
+    return open(infile, mode)
+
+
+def _chrom_sort(x):
+    """Return an integer for sorting from a chromosome."""
+    if x.startswith('chr'):
+        x = x[3:]
+    if x.upper() == 'X':
+        return 100
+    elif x.upper() == 'Y':
+        return 101
+    elif x.upper().startswith('M'):
+        return 150
+    elif x.isdigit():
+        return int(x)
+    else:
+        return x
 
 
 ###############################################################################
@@ -1011,7 +1370,8 @@ The output file will be three column tab-delimited file of:
     rsid, chromosome, location (base-1)
 """
 
-def get_arg_parser():
+
+def argument_parser():
     """Create an argument parser."""
     parser  = _argparse.ArgumentParser(
         description=__doc__, #usage=general_usage,
@@ -1046,6 +1406,18 @@ def get_arg_parser():
     filtering.add_argument('--distance', default='50kb',
                            help='Max distance to consider LD (50kb)')
 
+    # Optional files
+    paths = analyze.add_argument_group(
+        'data_paths',
+        'Paths to 1000genomes and dbSNP'
+    )
+    paths.add_argument('--dbsnp-path', default=DB_PATH,
+                       help='Path to dbSNP directory')
+    paths.add_argument('--dbsnp-ver', default=DB_VERS,
+                       help='dbSNP version to use')
+    paths.add_argument('--1000genomes', default=DATA_DIR,
+                       help='1000genomes data files')
+
     # Optional flags
     analyze.add_argument('-p', '--pandas', action="store_true",
                          help="Write file as a pandas DataFrame instead.")
@@ -1075,7 +1447,7 @@ def main(argv=None):
     if not argv:
         argv = _sys.argv[1:]
 
-    parser = get_arg_parser()
+    parser = argument_parser()
 
     args = parser.parse_args(argv)
 
@@ -1105,8 +1477,12 @@ def main(argv=None):
     else:
         pops = None
 
-    out = comp_snp_lists(snp_list, comp_list, pops, r2=float(args.r2),
-                         distance=args.distance, return_dataframe=True)
+    out = comp_snp_lists(
+        snp_list, comp_list, pops,
+        r2=float(args.r2),
+        distance=args.distance,
+        return_dataframe=True,
+    )
 
     if args.pandas:
         out.to_pickle(args.outfile)
