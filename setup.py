@@ -24,7 +24,7 @@ with codecs.open(os.path.join(here, 'README.rst'), encoding='utf-8') as f:
 
 setup(
     name='LD_Direction',
-    version='0.1.0a',
+    version='0.2.0b1',
     description=('Lookup LD between any two lists of SNPs'),
     long_description=long_description,
     url='https://github.com/MikeDacre/dbSNP',
