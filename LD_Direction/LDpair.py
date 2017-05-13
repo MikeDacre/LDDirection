@@ -182,6 +182,8 @@ def get_snp_info(snp):
     if not vcf:
         raise SNP_Lookup_Failure(snp + " is not in 1000G reference panel.")
     elif len(vcf) == 1:
+        if not vcf[0].strip():
+            raise SNP_Lookup_Failure(snp + " is not in 1000G reference panel.")
         geno = vcf[0].strip().split()
     else:
         geno = []

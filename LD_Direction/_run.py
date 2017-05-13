@@ -68,7 +68,7 @@ def run(command, raise_on_error=False):
 
 def run_cmnd(cmnd):
     """Run a command and return the output split into a list by newline."""
-    output, _, _ = _run.run(cmnd, raise_on_error=True)
+    output, _, _ = run(cmnd, raise_on_error=True)
     return output.strip().split('\n')
 
 
