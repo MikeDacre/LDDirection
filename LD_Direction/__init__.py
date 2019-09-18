@@ -56,7 +56,7 @@ Machiela MJ, Chanock SJ. LDlink a web-based application for exploring
     population-specific haplotype structure and linking correlated alleles of
     possible functional variants. Bioinformatics. 2015 Jul 2. PMID: 26139635.
 """
-__version__ = '0.2.0b1'
+__version__ = '0.2.0b2'
 
 __all__ = ['snp_link', 'compare_snp_lists']
 
