@@ -559,6 +559,8 @@ def pairs_to_dataframe(pairs):
         if not 'matches' in data:
             continue
         for snp2, info in data['matches'].items():
+            if not info['lookup']:
+                continue
             s1_alleles = sorted(info['lookup'][snp1])
             s2_alleles = [info['lookup'][snp1][i] for i in s1_alleles]
             rcols = [
