@@ -256,8 +256,21 @@ class PLINK(object):
             If plink job fails, returns an empty dictionary.
         """
         window_size = _run.get_length(window_size)
-        if not snps or not comp_list:
-            raise ValueError('snps and comp_list cannot be null')
+        if not snps:
+            logfile.write(
+                'ERROR: SNPS list for chrom {} empty, skipping.\n'.format(
+                    chrom
+                )
+            )
+            return {}
+        if not comp_list:
+            logfile.write(
+                'ERROR: COMP list for chrom {} empty, skipping.\n'.format(
+                    chrom
+                )
+            )
+            return {}
+
         snps = set(snps)
         comp_list = set(comp_list)
         bsnps = self.bim_snps(chrom)
